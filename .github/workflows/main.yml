@@ -5,7 +5,7 @@ on:
 
 jobs:
   secure-rdp:
-    runs-on: windows-11-arm
+    runs-on: windows-latest
     timeout-minutes: 3600
 
     steps:
@@ -23,6 +23,36 @@ jobs:
             dir=in action=allow protocol=TCP localport=3389
 
           Restart-Service -Name TermService -Force
+
+      - name: Install Docker
+        run: |
+          Write-Host "Attempting to install Docker..."
+          # Try Windows Server method first (Docker Engine via DockerMsftProvider)
+          try {
+              Write-Host "Trying DockerMsftProvider (Docker Engine for Windows Server)..."
+              Install-Module -Name DockerMsftProvider -Repository PSGallery -Force -ErrorAction Stop
+              Install-Package -Name docker -ProviderName DockerMsftProvider -Force -ErrorAction Stop
+              Start-Service docker -ErrorAction SilentlyContinue
+              Write-Host "Docker Engine installed via DockerMsftProvider."
+          } catch {
+              Write-Host "DockerMsftProvider approach failed or not supported, falling back to Chocolatey Docker Desktop..."
+              # Install via Chocolatey (Docker Desktop); chocolatey is available on GitHub Windows runners
+              choco install docker-desktop -y --no-progress
+              # Attempt to start Docker Desktop if installer set it up
+              $ddPath = 'C:\Program Files\Docker\Docker\Docker Desktop.exe'
+              if (Test-Path $ddPath) {
+                  Start-Process -FilePath $ddPath -ArgumentList "--accept-license" -WindowStyle Hidden
+                  Write-Host "Docker Desktop installed and start attempted."
+              } else {
+                  Write-Host "Docker Desktop installer not found after choco install; installation may require reboot."
+              }
+          }
+          # Verify docker availability
+          try {
+              docker --version
+          } catch {
+              Write-Host "Warning: docker command not available in PATH yet. A reboot or session restart may be required."
+          }
 
       - name: Create RDP User with Secure Password
         run: |
@@ -53,8 +83,7 @@ jobs:
 
       - name: Install Tailscale
         run: |
-          # Use arm64 installer for Windows ARM runner
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-arm64.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
@@ -78,26 +107,52 @@ jobs:
           }
           echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-      - name: Verify RDP Accessibility
+      - name: Verify RDP Accessibility and notify Discord
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          function Send-DiscordMessage($message) {
+              # Compose JSON payload and POST to webhook. The webhook is stored in a repository secret.
+              $payload = @{ content = $message } | ConvertTo-Json -Compress
+              try {
+                  Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
+              } catch {
+                  Write-Error "Failed to send Discord message: $_"
+              }
+          }
 
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          $tsIP = $env:TAILSCALE_IP
+          Send-DiscordMessage "Tailscale IP: $tsIP"
+
+          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
+              Send-DiscordMessage "TCP connection to RDP port 3389 failed for $tsIP"
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
-          Write-Host "TCP connectivity successful!"
+          Send-DiscordMessage "TCP connectivity to $tsIP:3389 successful!"
 
-      - name: Maintain Connection
+      - name: Maintain Connection and send periodic Discord pings
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
-          Write-Host "`n=== RDP ACCESS ==="
-          Write-Host "Address: $env:TAILSCALE_IP"
-          Write-Host "Username: RDP"
-          Write-Host "Password: $(echo $env:RDP_CREDS)"
-          Write-Host "==================`n"
+          function Send-DiscordMessage($message) {
+              $payload = @{ content = $message } | ConvertTo-Json -Compress
+              try {
+                  Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
+              } catch {
+                  Write-Error "Failed to send Discord message: $_"
+              }
+          }
+
+          $creds = $env:RDP_CREDS
+          $tsIP = $env:TAILSCALE_IP
+
+          # Send initial access info to Discord (credentials included)
+          Send-DiscordMessage "=== RDP ACCESS ===`nAddress: $tsIP`nCredentials: $creds`n=================="
 
           while ($true) {
-              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              $timestamp = Get-Date -Format o
+              Send-DiscordMessage "[$timestamp] RDP Active"
               Start-Sleep -Seconds 300
           }
