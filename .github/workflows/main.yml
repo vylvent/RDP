@@ -27,14 +27,144 @@ jobs:
       - name: Install Docker
         run: |
           Write-Host "Attempting to install Docker..."
-          # Try Windows Server method first (Docker Engine via DockerMsftProvider)
           try {
-              Write-Host "Trying DockerMsftProvider (Docker Engine for Windows Server)..."
               Install-Module -Name DockerMsftProvider -Repository PSGallery -Force -ErrorAction Stop
               Install-Package -Name docker -ProviderName DockerMsftProvider -Force -ErrorAction Stop
               Start-Service docker -ErrorAction SilentlyContinue
               Write-Host "Docker Engine installed via DockerMsftProvider."
           } catch {
+              Write-Host "Falling back to Chocolatey Docker Desktop..."
+              choco install docker-desktop -y --no-progress
+              $ddPath = 'C:\Program Files\Docker\Docker\Docker Desktop.exe'
+              if (Test-Path $ddPath) {
+                  Start-Process -FilePath $ddPath -ArgumentList "--accept-license" -WindowStyle Hidden
+                  Write-Host "Docker Desktop installed and start attempted."
+              } else {
+                  Write-Host "Docker Desktop installer not found after choco install; installation may require reboot."
+              }
+          }
+          try {
+              docker --version
+          } catch {
+              Write-Host "Warning: docker command not available in PATH yet."
+          }
+
+      - name: Create or update RDP user from secrets (secure)
+        env:
+          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          # Fail early if secrets are not present (avoid proceeding with defaults)
+          if (-not $env:RDP_USERNAME -or -not $env:RDP_PASSWORD) {
+              Write-Error "RDP_USERNAME and/or RDP_PASSWORD secrets are not set."
+              exit 1
+          }
+
+          $username = $env:RDP_USERNAME
+          $plain = $env:RDP_PASSWORD
+
+          # Convert to SecureString and create/update the local user.
+          # Do NOT write plaintext anywhere or echo it.
+          $securePass = ConvertTo-SecureString $plain -AsPlainText -Force
+
+          try {
+              if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+                  Set-LocalUser -Name $username -Password $securePass -ErrorAction Stop
+              } else {
+                  New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -ErrorAction Stop
+              }
+
+              # Grant necessary groups; failure to add to Administrators is non-fatal.
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction Stop
+              Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          } catch {
+              Write-Error "Failed to create or update local user: $_"
+              exit 1
+          } finally {
+              # Clear plaintext variable from memory ASAP
+              $plain = $null
+              [System.GC]::Collect()
+              [System.GC]::WaitForPendingFinalizers()
+          }
+
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale connection and verify RDP port
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TAILSCALE_AUTH_KEY) {
+              Write-Error "TAILSCALE_AUTH_KEY secret is not set."
+              exit 1
+          }
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+
+          # Validate RDP port is reachable before reporting status.
+          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+
+      - name: Notify Discord that RDP client is active (minimal, no secrets)
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          if (-not $env:DISCORD_WEBHOOK) {
+              Write-Error "DISCORD_WEBHOOK secret is not set."
+              exit 1
+          }
+
+          # Only send a single minimal non-sensitive message.
+          $payload = @{ content = "rdp-client active" } | ConvertTo-Json -Compress
+          try {
+              Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
+          } catch {
+              Write-Error "Failed to send Discord status message: $_"
+          }
+
+      - name: Maintain connection and periodic heartbeat
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          if (-not $env:DISCORD_WEBHOOK) {
+              Write-Error "DISCORD_WEBHOOK secret is not set."
+              exit 1
+          }
+
+          function Send-DiscordMessage($message) {
+              $payload = @{ content = $message } | ConvertTo-Json -Compress
+              try {
+                  Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
+              } catch {
+                  Write-Error "Failed to send Discord message: $_"
+              }
+          }
+
+          while ($true) {
+              Send-DiscordMessage "rdp-client active"
+              Start-Sleep -Seconds 300
+          }          } catch {
               Write-Host "DockerMsftProvider approach failed or not supported, falling back to Chocolatey Docker Desktop..."
               # Install via Chocolatey (Docker Desktop); chocolatey is available on GitHub Windows runners
               choco install docker-desktop -y --no-progress
