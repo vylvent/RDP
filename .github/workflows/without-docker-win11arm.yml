@@ -5,22 +5,18 @@ on:
 
 jobs:
   secure-rdp:
-    # Use the partner-provided Windows 11 ARM runner label
+    # This label requires a self-hosted or partner-provided Windows 11 ARM runner
     runs-on: windows-11-arm
     timeout-minutes: 3600
 
     steps:
       - name: Configure Core RDP Settings
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name "SecurityLayer" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
           Restart-Service -Name TermService -Force
 
       - name: Create or update RDP user from secrets (secure)
@@ -69,21 +65,43 @@ jobs:
             Write-Error "TAILSCALE_AUTH_KEY secret is not set."
             exit 1
           }
+          
+          Write-Host "Starting Tailscale..."
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+          
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
+          Write-Host "Attempting to get Tailscale IP..."
+          while (-not $tsIP -and $retries -lt 15) {
             $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            if ($tsIP) {
+              Write-Host "Successfully obtained Tailscale IP: $tsIP"
+              break
+            }
             Start-Sleep -Seconds 5
             $retries++
+            Write-Host "Retry attempt $retries..."
           }
+          
           if (-not $tsIP) {
-            Write-Error "Tailscale IP not assigned. Exiting."
+            Write-Error "Tailscale IP not assigned after multiple retries. Exiting."
+            & "$env:ProgramFiles\Tailscale\tailscale.exe" status # Print status for debugging
             exit 1
           }
-          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-            Write-Error "TCP connection to RDP port 3389 failed"
+          
+          Write-Host "Waiting for 10 seconds for the network to stabilize..."
+          Start-Sleep -Seconds 10
+          
+          Write-Host "Verifying RDP port 3389 on Tailscale IP: $tsIP"
+          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -InformationLevel Detailed
+          
+          if ($testResult.TcpTestSucceeded) {
+            Write-Host "TCP connection to RDP port 3389 was successful."
+          } else {
+            Write-Host "TCP connection to RDP port 3389 failed. Dumping firewall and service state..."
+            Get-NetFirewallRule -DisplayName "RDP-Tailscale" | Format-List
+            Get-Service -Name TermService | Select-Object -Property Name, Status
+            Write-Error "Validation failed. RDP port is not accessible over Tailscale."
             exit 1
           }
 
