@@ -1,10 +1,11 @@
-name: RDP-client without docker and win11-arm
+name: RDP-client-win11-arm
 
 on:
   workflow_dispatch:
 
 jobs:
   secure-rdp:
+    # Use the partner-provided Windows 11 ARM runner label
     runs-on: windows-11-arm
     timeout-minutes: 3600
 
@@ -12,16 +13,14 @@ jobs:
       - name: Configure Core RDP Settings
         run: |
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                            -Name "fDenyTSConnections" -Value 0 -Force
+            -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                            -Name "UserAuthentication" -Value 0 -Force
+            -Name "UserAuthentication" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                            -Name "SecurityLayer" -Value 0 -Force
-
+            -Name "SecurityLayer" -Value 0 -Force
           netsh advfirewall firewall delete rule name="RDP-Tailscale"
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
-
           Restart-Service -Name TermService -Force
 
       - name: Create or update RDP user from secrets (secure)
@@ -30,27 +29,28 @@ jobs:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           if (-not $env:RDP_USERNAME -or -not $env:RDP_PASSWORD) {
-              Write-Error "RDP_USERNAME and/or RDP_PASSWORD secrets are not set."
-              exit 1
+            Write-Error "RDP_USERNAME and/or RDP_PASSWORD secrets are not set."
+            exit 1
           }
           $username = $env:RDP_USERNAME
           $plain = $env:RDP_PASSWORD
           $securePass = ConvertTo-SecureString $plain -AsPlainText -Force
           try {
-              if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-                  Set-LocalUser -Name $username -Password $securePass -ErrorAction Stop
-              } else {
-                  New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -ErrorAction Stop
-              }
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction Stop
-              Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+            if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+              Set-LocalUser -Name $username -Password $securePass -ErrorAction Stop
+            } else {
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -ErrorAction Stop
+            }
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction Stop
+            Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
           } catch {
-              Write-Error "Failed to create or update local user: $_"
-              exit 1
+            Write-Error "Failed to create or update local user: $_"
+            exit 1
           } finally {
-              $plain = $null
-              [System.GC]::Collect()
-              [System.GC]::WaitForPendingFinalizers()
+            # Clear plaintext password variable ASAP
+            $plain = $null
+            [System.GC]::Collect()
+            [System.GC]::WaitForPendingFinalizers()
           }
 
       - name: Install Tailscale
@@ -66,25 +66,25 @@ jobs:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           if (-not $env:TAILSCALE_AUTH_KEY) {
-              Write-Error "TAILSCALE_AUTH_KEY secret is not set."
-              exit 1
+            Write-Error "TAILSCALE_AUTH_KEY secret is not set."
+            exit 1
           }
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+            $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+            Start-Sleep -Seconds 5
+            $retries++
           }
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
+            Write-Error "Tailscale IP not assigned. Exiting."
+            exit 1
           }
           $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
+            Write-Error "TCP connection to RDP port 3389 failed"
+            exit 1
           }
 
       - name: Notify Discord that RDP client is active (optional)
@@ -92,36 +92,40 @@ jobs:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           function Send-DiscordMessage($message) {
-              if (-not $env:DISCORD_WEBHOOK) {
-                  Write-Host "DISCORD_WEBHOOK not set; skipping Discord notification."
-                  return
-              }
-              $payload = @{ content = $message } | ConvertTo-Json -Compress
-              try {
-                  Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
-              } catch {
-                  Write-Error "Failed to send Discord message: $_"
-              }
+            if (-not $env:DISCORD_WEBHOOK) {
+              Write-Host "DISCORD_WEBHOOK not set; skipping Discord notification."
+              return
+            }
+            $payload = @{
+              content = $message
+            } | ConvertTo-Json -Compress
+            try {
+              Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
+            } catch {
+              Write-Error "Failed to send Discord message: $_"
+            }
           }
-          Send-DiscordMessage "rdp-client active"
+          Send-DiscordMessage "rdp-client-arm active"
 
       - name: Maintain connection and periodic heartbeat (Discord optional)
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           function Send-DiscordMessage($message) {
-              if (-not $env:DISCORD_WEBHOOK) {
-                  Write-Host "DISCORD_WEBHOOK not set; skipping Discord heartbeat."
-                  return
-              }
-              $payload = @{ content = $message } | ConvertTo-Json -Compress
-              try {
-                  Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
-              } catch {
-                  Write-Error "Failed to send Discord message: $_"
-              }
+            if (-not $env:DISCORD_WEBHOOK) {
+              Write-Host "DISCORD_WEBHOOK not set; skipping Discord heartbeat."
+              return
+            }
+            $payload = @{
+              content = $message
+            } | ConvertTo-Json -Compress
+            try {
+              Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
+            } catch {
+              Write-Error "Failed to send Discord message: $_"
+            }
           }
           while ($true) {
-              Send-DiscordMessage "rdp-client active"
-              Start-Sleep -Seconds 300
+            Send-DiscordMessage "rdp-client-arm active"
+            Start-Sleep -Seconds 300
           }
