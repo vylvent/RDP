@@ -1,4 +1,4 @@
-name: RDP-client-win11-arm
+name: RDP-client win11-arm
 
 on:
   workflow_dispatch:
