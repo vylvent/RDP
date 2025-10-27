@@ -107,10 +107,12 @@ jobs:
 
       - name: Notify Discord that RDP is Active (Optional)
         if: success() && env.DISCORD_WEBHOOK != ''
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         shell: pwsh
         run: |
           $payload = @{
-            content = "✅ Windows ARM RDP runner is active and ready for connection at ${{ env.TS_IP }}. User: ${{ secrets.RDP_USERNAME }}"
+            content = "✅ Windows ARM RDP runner is active and ready for connection at $env:TS_IP. User: ${{ secrets.RDP_USERNAME }}"
           } | ConvertTo-Json
           Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload
 
