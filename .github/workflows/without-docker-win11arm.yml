@@ -7,14 +7,11 @@ on:
 # TAILSCALE_AUTHKEY: Your Tailscale ephemeral auth key.
 # RDP_USERNAME: The desired username for the RDP user.
 # RDP_PASSWORD: The password for the RDP user.
-# DISCORD_WEBHOOK: (Optional) A Discord webhook URL for notifications.
 
 jobs:
   rdp-session:
     runs-on: windows-11-arm # Specifically using the Windows 11 ARM runner.
     timeout-minutes: 360 # The job will run for a maximum of 6 hours
-    env:
-      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
     steps:
       - name: Checkout code
@@ -105,20 +102,9 @@ jobs:
             exit 1
           }
 
-      - name: Notify Discord that RDP is Active (Optional)
-        if: success() && env.DISCORD_WEBHOOK != ''
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        shell: pwsh
-        run: |
-          $payload = @{
-            content = "✅ Windows ARM RDP runner is active and ready for connection at $env:TS_IP. User: ${{ secrets.RDP_USERNAME }}"
-          } | ConvertTo-Json
-          Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload
-
       - name: Keep Runner Alive
         shell: pwsh
         run: |
           Write-Host "Runner is now in a waiting state. You can connect via RDP."
           Write-Host "This job will automatically time out after 6 hours."
-          Start-Sleep -Seconds 21600 # Sleep for the remaining duration of the timeout
+          Start-Sleep -Seconds 21600 # Sleep for the full 6 hours (360 minutes)
