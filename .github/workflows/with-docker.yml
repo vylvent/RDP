@@ -1,165 +1,120 @@
-name: RDP-client with docker
+name: RDP-client win11-arm
 
 on:
   workflow_dispatch:
 
+# These secrets need to be configured in the repository settings:
+# TAILSCALE_AUTHKEY: Your Tailscale ephemeral auth key.
+# RDP_USERNAME: The desired username for the RDP user.
+# RDP_PASSWORD: The password for the RDP user.
+# DISCORD_WEBHOOK: (Optional) A Discord webhook URL for notifications.
+
 jobs:
-  secure-rdp:
-    runs-on: windows-latest
-    timeout-minutes: 3600
+  rdp-session:
+    runs-on: windows-11-arm # Specifically using the Windows 11 ARM runner.
+    timeout-minutes: 360 # The job will run for a maximum of 6 hours
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure RDP Service and Firewall
         run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                            -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                            -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                            -Name "SecurityLayer" -Value 0 -Force
-
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
-          netsh advfirewall firewall add rule name="RDP-Tailscale" `
-            dir=in action=allow protocol=TCP localport=3389
-
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
+          # Forcing Network Level Authentication for better security.
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Restart-Service -Name TermService -Force
+          Write-Host "RDP service and firewall configured."
 
-      - name: Install Docker (Chocolatey only)
-        run: |
-          Write-Host "Installing Docker Desktop via Chocolatey..."
-          # Ensure chocolatey is available on the runner
-          if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-              Write-Error "Chocolatey (choco) is not available on this runner; cannot install Docker Desktop."
-              exit 1
-          }
-
-          choco install docker-desktop -y --no-progress
-
-          # Try to start Docker Desktop if installer placed the exe
-          $ddPath = 'C:\Program Files\Docker\Docker\Docker Desktop.exe'
-          if (Test-Path $ddPath) {
-              Start-Process -FilePath $ddPath -ArgumentList "--accept-license" -WindowStyle Hidden
-              Write-Host "Docker Desktop installed and start attempted."
-          } else {
-              Write-Host "Docker Desktop installer not found after choco install; installation may require reboot."
-          }
-
-          # Verify docker availability (may require session/reboot)
-          try {
-              docker --version
-          } catch {
-              Write-Host "docker command not available in PATH yet. A reboot or session restart may be required."
-          }
-
-      - name: Create or update RDP user from secrets (secure)
+      - name: Create or Update Secure RDP User
         env:
           RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        shell: pwsh
         run: |
           if (-not $env:RDP_USERNAME -or -not $env:RDP_PASSWORD) {
-              Write-Error "RDP_USERNAME and/or RDP_PASSWORD secrets are not set."
-              exit 1
+            Write-Error "RDP_USERNAME and/or RDP_PASSWORD secrets are not set. Please configure them in repository settings."
+            exit 1
           }
-
           $username = $env:RDP_USERNAME
-          $plain = $env:RDP_PASSWORD
+          $password = $env:RDP_PASSWORD
+          $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
 
-          $securePass = ConvertTo-SecureString $plain -AsPlainText -Force
-
-          try {
-              if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-                  Set-LocalUser -Name $username -Password $securePass -ErrorAction Stop
-              } else {
-                  New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -ErrorAction Stop
-              }
-
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction Stop
-              Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
-          } catch {
-              Write-Error "Failed to create or update local user: $_"
-              exit 1
-          } finally {
-              # Clear plaintext password variable ASAP
-              $plain = $null
-              [System.GC]::Collect()
-              [System.GC]::WaitForPendingFinalizers()
+          # Check if the user exists
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+            Write-Host "User '$username' already exists. Updating password."
+            Set-LocalUser -Name $username -Password $securePassword
+          } else {
+            Write-Host "Creating new user '$username'."
+            New-LocalUser -Name $username -Password $securePassword -FullName $username
+            # Set the user to not have to change password at next logon
+            $user = Get-LocalUser -Name $username
+            $user.PasswordNeverExpires = $true
+            $user | Set-LocalUser
           }
 
-      - name: Install Tailscale
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Write-Host "User '$username' has been configured for RDP and administrator access."
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@v2
+        with:
+          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
+          hostname: gh-runner-win-arm
+
+      - name: Verify RDP Accessibility over Tailscale
+        shell: pwsh
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
-          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
-          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
-          Remove-Item $installerPath -Force
-
-      - name: Establish Tailscale connection and verify RDP port
-        env:
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        run: |
-          if (-not $env:TAILSCALE_AUTH_KEY) {
-              Write-Error "TAILSCALE_AUTH_KEY secret is not set."
-              exit 1
-          }
-
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
-
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          Write-Host "Attempting to retrieve Tailscale IP address..."
+          # Loop to wait for the Tailscale IP to be assigned
+          while (-not $tsIP -and $retries -lt 15) {
+            $tsIP = tailscale ip -4
+            if ($tsIP) {
+              Write-Host "Successfully obtained Tailscale IP: $tsIP"
+              break
+            }
+            Start-Sleep -Seconds 4
+            $retries++
+            Write-Host "Retry attempt $retries..."
           }
-
+          
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
+            Write-Error "Could not retrieve Tailscale IP after multiple retries. Check Tailscale status."
+            tailscale status
+            exit 1
+          }
+          
+          # Add the IP to the GitHub environment for later steps
+          echo "TS_IP=$tsIP" >> $env:GITHUB_ENV
+          
+          Write-Host "Waiting 10 seconds for network to stabilize before testing connection..."
+          Start-Sleep -Seconds 10
+          
+          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -InformationLevel Quiet
+          if ($testResult) {
+            Write-Host "SUCCESS: RDP port 3389 is accessible over Tailscale."
+          } else {
+            Write-Error "FAILURE: RDP port is not accessible. Please check runner firewall and Tailscale ACLs."
+            exit 1
           }
 
-          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-
-      - name: Notify Discord that RDP client is active (optional)
+      - name: Notify Discord that RDP is Active (Optional)
+        if: success() && secrets.DISCORD_WEBHOOK
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        shell: pwsh
         run: |
-          function Send-DiscordMessage($message) {
-              if (-not $env:DISCORD_WEBHOOK) {
-                  Write-Host "DISCORD_WEBHOOK not set; skipping Discord notification."
-                  return
-              }
-              $payload = @{ content = $message } | ConvertTo-Json -Compress
-              try {
-                  Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
-              } catch {
-                  Write-Error "Failed to send Discord message: $_"
-              }
-          }
+          $payload = @{
+            content = "✅ Windows ARM RDP runner is active and ready for connection at `${{ env.TS_IP }}`. User: `${{ secrets.RDP_USERNAME }}`"
+          } | ConvertTo-Json
+          Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload
 
-          Send-DiscordMessage "rdp-client active"
-
-      - name: Maintain connection and periodic heartbeat (Discord optional)
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+      - name: Keep Runner Alive
         run: |
-          function Send-DiscordMessage($message) {
-              if (-not $env:DISCORD_WEBHOOK) {
-                  Write-Host "DISCORD_WEBHOOK not set; skipping Discord heartbeat."
-                  return
-              }
-              $payload = @{ content = $message } | ConvertTo-Json -Compress
-              try {
-                  Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
-              } catch {
-                  Write-Error "Failed to send Discord message: $_"
-              }
-          }
-
-          while ($true) {
-              Send-DiscordMessage "rdp-client active"
-              Start-Sleep -Seconds 300
-          }
+          Write-Host "Runner is now in a waiting state. You can connect via RDP."
+          Write-Host "This job will automatically time out after 6 hours."
+          Start-Sleep -Seconds 21600 # Sleep for the remaining duration of the timeout
