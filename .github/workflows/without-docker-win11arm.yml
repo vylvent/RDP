@@ -1,110 +1,57 @@
-name: RDP-client win11-arm
+name: RDP-client-win11-arm
 
 on:
   workflow_dispatch:
 
-# These secrets need to be configured in the repository settings:
-# TAILSCALE_AUTHKEY: Your Tailscale ephemeral auth key.
-# RDP_USERNAME: The desired username for the RDP user.
-# RDP_PASSWORD: The password for the RDP user.
-
 jobs:
   rdp-session:
-    runs-on: windows-11-arm # Specifically using the Windows 11 ARM runner.
-    timeout-minutes: 360 # The job will run for a maximum of 6 hours
+    runs-on: windows-latest
+    timeout-minutes: 360 
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Configure RDP Service and Firewall
-        run: |
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          # Forcing Network Level Authentication for better security.
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Restart-Service -Name TermService -Force
-          Write-Host "RDP service and firewall configured."
-        shell: pwsh
-
-      - name: Create or Update Secure RDP User
+      - name: Setup RDP User and Service
         env:
           RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         shell: pwsh
         run: |
           if (-not $env:RDP_USERNAME -or -not $env:RDP_PASSWORD) {
-            Write-Error "RDP_USERNAME and/or RDP_PASSWORD secrets are not set. Please configure them in repository settings."
+            Write-Error "RDP_USERNAME and RDP_PASSWORD secrets must be set in repository settings."
             exit 1
           }
-          $username = $env:RDP_USERNAME
-          $password = $env:RDP_PASSWORD
-          $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
 
-          # Check if the user exists
+          # Create and configure the user
+          $username = $env:RDP_USERNAME
+          $password = ConvertTo-SecureString -String $env:RDP_PASSWORD -AsPlainText -Force
           if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-            Write-Host "User '$username' already exists. Updating password."
-            Set-LocalUser -Name $username -Password $securePassword
+            Write-Host "User '$username' already exists. Setting new password."
+            Set-LocalUser -Name $username -Password $password
           } else {
             Write-Host "Creating new user '$username'."
-            New-LocalUser -Name $username -Password $securePassword -FullName $username -Description "RDP User for GitHub Actions"
-            # Set the user to not have to change password at next logon
-            $user = Get-LocalUser -Name $username
-            $user | Set-LocalUser -PasswordNeverExpires $true
+            New-LocalUser -Name $username -Password $password -FullName "RDP User"
+            Set-LocalUser -Name $username -PasswordNeverExpires $true
           }
-
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
           Add-LocalGroupMember -Group "Administrators" -Member $username
-          Write-Host "User '$username' has been configured for RDP and administrator access."
+          Write-Host "User '$username' configured for RDP and administrator access."
 
-      - name: Connect to Tailscale
+          # Enable RDP and configure firewall
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
+          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
+          Write-Host "RDP service and firewall have been configured."
+
+      - name: Connect via Tailscale
         uses: tailscale/github-action@v2
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
           hostname: gh-runner-win-arm
 
-      - name: Verify RDP Accessibility over Tailscale
+      - name: Wait for RDP Connection
         shell: pwsh
         run: |
-          $tsIP = $null
-          $retries = 0
-          Write-Host "Attempting to retrieve Tailscale IP address..."
-          # Loop to wait for the Tailscale IP to be assigned
-          while (-not $tsIP -and $retries -lt 15) {
-            $tsOutput = & tailscale ip -4 2>$null
-            if ($tsOutput) {
-              $tsIP = $tsOutput.Trim()
-              Write-Host "Successfully obtained Tailscale IP: $tsIP"
-              break
-            }
-            Start-Sleep -Seconds 4
-            $retries++
-            Write-Host "Retry attempt $retries..."
-          }
-          
-          if (-not $tsIP) {
-            Write-Error "Could not retrieve Tailscale IP after multiple retries. Check Tailscale status."
-            & tailscale status
-            exit 1
-          }
-          
-          # Add the IP to the GitHub environment for later steps
-          echo "TS_IP=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-          
-          Write-Host "Waiting 10 seconds for network to stabilize before testing connection..."
-          Start-Sleep -Seconds 10
-          
-          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -InformationLevel Quiet
-          if ($testResult) {
-            Write-Host "SUCCESS: RDP port 3389 is accessible over Tailscale."
-          } else {
-            Write-Error "FAILURE: RDP port is not accessible. Please check runner firewall and Tailscale ACLs."
-            exit 1
-          }
-
-      - name: Keep Runner Alive
-        shell: pwsh
-        run: |
-          Write-Host "Runner is now in a waiting state. You can connect via RDP."
-          Write-Host "This job will automatically time out after 6 hours."
-          Start-Sleep -Seconds 21600 # Sleep for the full 6 hours (360 minutes)
+          Write-Host "The runner is ready for an RDP connection."
+          Write-Host "This job will remain active for up to 6 hours."
+          Start-Sleep -Seconds 21600
