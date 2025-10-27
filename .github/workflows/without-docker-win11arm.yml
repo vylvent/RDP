@@ -3,7 +3,7 @@ name: RDP-client win11-arm
 on:
   workflow_dispatch:
 
-# configure these secrets in the repository settings:
+# These secrets need to be configured in the repository settings:
 # TAILSCALE_AUTHKEY: Your Tailscale ephemeral auth key.
 # RDP_USERNAME: The desired username for the RDP user.
 # RDP_PASSWORD: The password for the RDP user.
@@ -11,26 +11,21 @@ on:
 
 jobs:
   rdp-session:
-    runs-on: windows-11-arm
+    runs-on: windows-11-arm # Specifically using the Windows 11 ARM runner.
     timeout-minutes: 360 # The job will run for a maximum of 6 hours
+    env:
+      DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
 
     steps:
       - name: Checkout code
-        uses: actions/checkout@v3
+        uses: actions/checkout@v4
 
       - name: Configure RDP Service and Firewall
         run: |
-          # Enable RDP connections by setting the registry key
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0 -Force
-          
-          # Forcing lower security for broader client compatibility, adjust if needed
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "SecurityLayer" -Value 0 -Force
-          
-          # Create a specific firewall rule for RDP over any interface
+          # Forcing Network Level Authentication for better security.
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name "UserAuthentication" -Value 1 -Force
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          
-          # Restart the Remote Desktop service to apply changes
           Restart-Service -Name TermService -Force
           Write-Host "RDP service and firewall configured."
 
@@ -38,53 +33,47 @@ jobs:
         env:
           RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        shell: pwsh
         run: |
           if (-not $env:RDP_USERNAME -or -not $env:RDP_PASSWORD) {
             Write-Error "RDP_USERNAME and/or RDP_PASSWORD secrets are not set. Please configure them in repository settings."
             exit 1
           }
           $username = $env:RDP_USERNAME
-          $plainPassword = $env:RDP_PASSWORD
-          $securePassword = ConvertTo-SecureString $plainPassword -AsPlainText -Force
-          
-          try {
-            # Check if the user exists
-            if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-              Write-Host "User '$username' already exists. Updating password."
-              Set-LocalUser -Name $username -Password $securePassword -ErrorAction Stop
-            } else {
-              Write-Host "Creating new user '$username'."
-              New-LocalUser -Name $username -Password $securePassword -AccountNeverExpires -ErrorAction Stop
-            }
-            
-            # Add user to necessary groups
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction Stop
-            Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
-            Write-Host "User '$username' has been configured for RDP and administrator access."
-          } catch {
-            Write-Error "Failed to create or update local user: $_"
-            exit 1
-          } finally {
-            # Securely clear the plaintext password variable from memory
-            $plainPassword = $null
-            [System.GC]::Collect()
-            [System.GC]::WaitForPendingFinalizers()
+          $password = $env:RDP_PASSWORD
+          $securePassword = ConvertTo-SecureString -String $password -AsPlainText -Force
+
+          # Check if the user exists
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+            Write-Host "User '$username' already exists. Updating password."
+            Set-LocalUser -Name $username -Password $securePassword
+          } else {
+            Write-Host "Creating new user '$username'."
+            New-LocalUser -Name $username -Password $securePassword -FullName $username
+            # Set the user to not have to change password at next logon
+            $user = Get-LocalUser -Name $username
+            $user.PasswordNeverExpires = $true
+            $user | Set-LocalUser
           }
+
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Write-Host "User '$username' has been configured for RDP and administrator access."
 
       - name: Connect to Tailscale
         uses: tailscale/github-action@v2
         with:
           authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          hostname: gh-runner-rdp
+          hostname: gh-runner-win-arm
 
       - name: Verify RDP Accessibility over Tailscale
+        shell: pwsh
         run: |
           $tsIP = $null
           $retries = 0
           Write-Host "Attempting to retrieve Tailscale IP address..."
           # Loop to wait for the Tailscale IP to be assigned
           while (-not $tsIP -and $retries -lt 15) {
-            # The Tailscale action adds the executable to the PATH
             $tsIP = tailscale ip -4
             if ($tsIP) {
               Write-Host "Successfully obtained Tailscale IP: $tsIP"
@@ -101,50 +90,31 @@ jobs:
             exit 1
           }
           
+          # Add the IP to the GitHub environment for later steps
+          echo "TS_IP=$tsIP" >> $env:GITHUB_ENV
+          
           Write-Host "Waiting 10 seconds for network to stabilize before testing connection..."
           Start-Sleep -Seconds 10
           
-          Write-Host "Verifying RDP port 3389 is accessible on Tailscale IP: $tsIP"
           $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -InformationLevel Quiet
-          
           if ($testResult) {
             Write-Host "SUCCESS: RDP port 3389 is accessible over Tailscale."
           } else {
             Write-Error "FAILURE: RDP port is not accessible. Please check runner firewall and Tailscale ACLs."
             exit 1
           }
-          
-          # Output the IP to the job summary for easy access
-          echo "ts_ip=$tsIP" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: Notify Discord that RDP is Active (Optional)
-        if: success() && secrets.DISCORD_WEBHOOK
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          TS_IP: ${{ env.ts_ip }}
+        if: success() && env.DISCORD_WEBHOOK != ''
+        shell: pwsh
         run: |
           $payload = @{
-            content = "✅ Windows ARM RDP runner is active and ready for connection at `${env:TS_IP}`. User: `${{ secrets.RDP_USERNAME }}`"
-          } | ConvertTo-Json -Compress
+            content = "✅ Windows ARM RDP runner is active and ready for connection at `${{ env.TS_IP }}`. User: `${{ secrets.RDP_USERNAME }}`"
+          } | ConvertTo-Json
           Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload
 
       - name: Keep Runner Alive
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           Write-Host "Runner is now in a waiting state. You can connect via RDP."
           Write-Host "This job will automatically time out after 6 hours."
-          $timer = 0
-          while ($true) {
-            Start-Sleep -Seconds 600 # Sleep for 10 minutes
-            $timer += 10
-            Write-Host "Runner alive for $timer minutes..."
-            
-            # Optional: Send a heartbeat message to Discord every hour
-            if (($timer % 60) -eq 0 -and $env:DISCORD_WEBHOOK) {
-              $payload = @{
-                content = "Heartbeat: Windows ARM RDP runner is still active."
-              } | ConvertTo-Json -Compress
-              Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload
-            }
-          }
+          Start-Sleep -Seconds 21600 # Sleep for the remaining duration of the timeout
