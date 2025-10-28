@@ -45,7 +45,7 @@ jobs:
 
       - name: Install and Connect Tailscale
         env:
-          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+          TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
         shell: pwsh
         run: |
           if (-not $env:TS_AUTH_KEY) {
@@ -62,6 +62,58 @@ jobs:
           
           # Connect to Tailscale
           & "C:\Program Files\Tailscale\tailscale.exe" up --authkey $env:TS_AUTH_KEY --hostname "github-runner"
+
+      - name: Notify Discord with Connection Info
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
+        shell: pwsh
+        run: |
+          if (-not $env:DISCORD_WEBHOOK_URL) {
+            Write-Host "DISCORD_WEBHOOK_URL secret not set. Skipping notification."
+            exit 0
+          }
+
+          # Get the Tailscale IP Address
+          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          if (-not $ts_ip) {
+            $ts_ip = "Error: Could not retrieve IP"
+          }
+
+          # Construct the JSON payload for Discord using an embed
+          $payload = @{
+            embeds = @(
+              @{
+                title = "✅ RDP Runner is Ready for Connection"
+                description = "Your GitHub Actions runner is configured and waiting for a connection."
+                color = 3447003 # Blue
+                fields = @(
+                  @{
+                    name = "Tailscale IP Address"
+                    value = "`$ts_ip`"
+                    inline = $false
+                  },
+                  @{
+                    name = "Username"
+                    value = "`$($env:RDP_USERNAME)`"
+                    inline = $false
+                  },
+                  @{
+                    name = "Password"
+                    value = "Use the password from your repository secrets (`RDP_PASSWORD`)."
+                    inline = $false
+                  }
+                )
+                footer = @{
+                  text = "This session will remain active for up to 6 hours."
+                }
+              }
+            )
+          } | ConvertTo-Json -Depth 5
+
+          # Send the notification
+          Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK_URL -Method Post -Body $payload -ContentType 'application/json'
+          Write-Host "Successfully sent connection details to Discord."
 
       - name: Wait for RDP Connection
         shell: pwsh
