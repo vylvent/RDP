@@ -5,8 +5,8 @@ on:
 
 jobs:
   rdp-session:
-    runs-on: windows-latest
-    timeout-minutes: 360 
+    runs-on: windows-11-arm
+    timeout-minutes: 360
 
     steps:
       - name: Checkout code
@@ -43,11 +43,25 @@ jobs:
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
           Write-Host "RDP service and firewall have been configured."
 
-      - name: Connect via Tailscale
-        uses: tailscale/github-action@v2
-        with:
-          authkey: ${{ secrets.TAILSCALE_AUTHKEY }}
-          hostname: gh-runner-win-arm
+      - name: Install and Connect Tailscale
+        env:
+          TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
+        shell: pwsh
+        run: |
+          if (-not $env:TS_AUTH_KEY) {
+            Write-Error "TS_AUTH_KEY secret must be set in repository settings."
+            exit 1
+          }
+          
+          # Download Tailscale installer
+          $installerPath = "C:\Users\runneradmin\Downloads\tailscale-setup.exe"
+          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $installerPath
+          
+          # Install Tailscale silently
+          Start-Process -FilePath $installerPath -ArgumentList "/S" -Wait
+          
+          # Connect to Tailscale
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey $env:TS_AUTH_KEY --hostname "github-runner"
 
       - name: Wait for RDP Connection
         shell: pwsh
