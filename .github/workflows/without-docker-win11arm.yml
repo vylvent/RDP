@@ -4,120 +4,136 @@ on:
   workflow_dispatch:
 
 jobs:
-  rdp-session:
+  secure-rdp:
     runs-on: windows-11-arm
-    timeout-minutes: 360
+    timeout-minutes: 3600
 
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
+      - name: Configure Core RDP Settings
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+                            -Name "fDenyTSConnections" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+                            -Name "SecurityLayer" -Value 0 -Force
 
-      - name: Setup RDP User and Service
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create or update RDP user from secrets (secure)
         env:
           RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-        shell: pwsh
         run: |
           if (-not $env:RDP_USERNAME -or -not $env:RDP_PASSWORD) {
-            Write-Error "RDP_USERNAME and RDP_PASSWORD secrets must be set in repository settings."
-            exit 1
+              Write-Error "RDP_USERNAME and/or RDP_PASSWORD secrets are not set."
+              exit 1
           }
 
-          # Create and configure the user
           $username = $env:RDP_USERNAME
-          $password = ConvertTo-SecureString -String $env:RDP_PASSWORD -AsPlainText -Force
-          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-            Write-Host "User '$username' already exists. Setting new password."
-            Set-LocalUser -Name $username -Password $password
-          } else {
-            Write-Host "Creating new user '$username'."
-            New-LocalUser -Name $username -Password $password -FullName "RDP User"
-            Set-LocalUser -Name $username -PasswordNeverExpires $true
-          }
-          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
-          Add-LocalGroupMember -Group "Administrators" -Member $username
-          Write-Host "User '$username' configured for RDP and administrator access."
+          $plain = $env:RDP_PASSWORD
 
-          # Enable RDP and configure firewall
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name "fDenyTSConnections" -Value 0
-          Enable-NetFirewallRule -DisplayGroup "Remote Desktop"
-          Write-Host "RDP service and firewall have been configured."
+          $securePass = ConvertTo-SecureString $plain -AsPlainText -Force
 
-      - name: Install and Connect Tailscale
-        env:
-          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
-        shell: pwsh
-        run: |
-          if (-not $env:TS_AUTH_KEY) {
-            Write-Error "TS_AUTH_KEY secret must be set in repository settings."
-            exit 1
-          }
-          
-          # Download Tailscale installer
-          $installerPath = "C:\Users\runneradmin\Downloads\tailscale-setup.exe"
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $installerPath
-          
-          # Install Tailscale silently
-          Start-Process -FilePath $installerPath -ArgumentList "/S" -Wait
-          
-          # Connect to Tailscale
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey $env:TS_AUTH_KEY --hostname "github-runner"
-
-      - name: Notify Discord with Connection Info
-        env:
-          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
-          RDP_USERNAME: ${{ secrets.RDP_USERNAME }}
-        shell: pwsh
-        run: |
-          if (-not $env:DISCORD_WEBHOOK_URL) {
-            Write-Host "DISCORD_WEBHOOK_URL secret not set. Skipping notification."
-            exit 0
-          }
-
-          # Get the Tailscale IP Address
-          $ts_ip = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-          if (-not $ts_ip) {
-            $ts_ip = "Error: Could not retrieve IP"
-          }
-
-          # Construct the JSON payload for Discord using an embed
-          $payload = @{
-            embeds = @(
-              @{
-                title = "✅ RDP Runner is Ready for Connection"
-                description = "Your GitHub Actions runner is configured and waiting for a connection."
-                color = 3447003 # Blue
-                fields = @(
-                  @{
-                    name = "Tailscale IP Address"
-                    value = "`$ts_ip`"
-                    inline = $false
-                  },
-                  @{
-                    name = "Username"
-                    value = "`$($env:RDP_USERNAME)`"
-                    inline = $false
-                  },
-                  @{
-                    name = "Password"
-                    value = "Use the password from your repository secrets (`RDP_PASSWORD`)."
-                    inline = $false
-                  }
-                )
-                footer = @{
-                  text = "This session will remain active for up to 6 hours."
-                }
+          try {
+              if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+                  Set-LocalUser -Name $username -Password $securePass -ErrorAction Stop
+              } else {
+                  New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -ErrorAction Stop
               }
-            )
-          } | ConvertTo-Json -Depth 5
 
-          # Send the notification
-          Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK_URL -Method Post -Body $payload -ContentType 'application/json'
-          Write-Host "Successfully sent connection details to Discord."
+              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction Stop
+              Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+          } catch {
+              Write-Error "Failed to create or update local user: $_"
+              exit 1
+          } finally {
+              # Clear plaintext password variable ASAP
+              $plain = $null
+              [System.GC]::Collect()
+              [System.GC]::WaitForPendingFinalizers()
+          }
 
-      - name: Wait for RDP Connection
-        shell: pwsh
+      - name: Install Tailscale
         run: |
-          Write-Host "The runner is ready for an RDP connection."
-          Write-Host "This job will remain active for up to 6 hours."
-          Start-Sleep -Seconds 21600
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-arm64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      - name: Establish Tailscale connection and verify RDP port
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TAILSCALE_AUTH_KEY) {
+              Write-Error "TAILSCALE_AUTH_KEY secret is not set."
+              exit 1
+          }
+
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+
+          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+
+      - name: Notify Discord that RDP client is active (optional)
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          function Send-DiscordMessage($message) {
+              if (-not $env:DISCORD_WEBHOOK) {
+                  Write-Host "DISCORD_WEBHOOK not set; skipping Discord notification."
+                  return
+              }
+              $payload = @{ content = $message } | ConvertTo-Json -Compress
+              try {
+                  Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
+              } catch {
+                  Write-Error "Failed to send Discord message: $_"
+              }
+          }
+
+          # Only send a minimal non-sensitive message; skip if webhook is not configured.
+          Send-DiscordMessage "rdp-client active"
+
+      - name: Maintain connection and periodic heartbeat (Discord optional)
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+        run: |
+          function Send-DiscordMessage($message) {
+              if (-not $env:DISCORD_WEBHOOK) {
+                  Write-Host "DISCORD_WEBHOOK not set; skipping Discord heartbeat."
+                  return
+              }
+              $payload = @{ content = $message } | ConvertTo-Json -Compress
+              try {
+                  Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
+              } catch {
+                  Write-Error "Failed to send Discord message: $_"
+              }
+          }
+
+          while ($true) {
+              Send-DiscordMessage "rdp-client active"
+              Start-Sleep -Seconds 300
+          }
