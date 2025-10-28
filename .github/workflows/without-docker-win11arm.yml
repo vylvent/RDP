@@ -45,7 +45,7 @@ jobs:
 
       - name: Install and Connect Tailscale
         env:
-          TS_AUTH_KEY: ${{ secrets.TS_AUTH_KEY }}
+          TS_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         shell: pwsh
         run: |
           if (-not $env:TS_AUTH_KEY) {
