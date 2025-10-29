@@ -162,8 +162,13 @@ jobs:
             )
             foreach ($p in $possibleLogs) {
               if (Test-Path $p) {
-                Write-Host "Contents of $p:"
-                try { Get-ChildItem -Path $p -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "---- $_ ----"; Get-Content -Path $_ -Tail 200 -ErrorAction SilentlyContinue } } catch {}
+                Write-Host "Contents of $($p):"
+                try {
+                  Get-ChildItem -Path $p -ErrorAction SilentlyContinue | ForEach-Object {
+                    Write-Host "---- $_ ----"
+                    try { Get-Content -Path $_ -Tail 200 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ } } catch {}
+                  }
+                } catch {}
               } else {
                 Write-Host "No path: $p"
               }
