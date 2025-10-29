@@ -6,7 +6,7 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-11-arm
-    timeout-minutes: 3600
+    timeout-minutes: 360
 
     steps:
       - name: Configure Core RDP Settings
@@ -61,7 +61,7 @@ jobs:
       - name: Install Tailscale
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
-          $installerPath = "$env:TEMP\tailscale.exe"
+          $installerPath = "$env:TEMP\tailscale.msi"
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
