@@ -21,11 +21,11 @@ jobs:
           # Allow incoming RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
 
-          # Compatibility: disable NLA/SecurityLayer if required (adjust for security posture)
+          # Compatibility: adjust NLA/SecurityLayer as needed
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
 
-          # Ensure firewall rule for RDP exists
+          # Firewall rule (idempotent)
           try { netsh advfirewall firewall delete rule name='RDP-Tailscale' 2>$null } catch {}
           netsh advfirewall firewall add rule name='RDP-Tailscale' dir=in action=allow protocol=TCP localport=3389
 
@@ -44,6 +44,7 @@ jobs:
           $username = $env:RDP_USERNAME
           $plain = $env:RDP_PASSWORD
 
+          # Immediately convert to secure string and clear plaintext
           $securePass = ConvertTo-SecureString $plain -AsPlainText -Force
           $plain = $null
           [System.GC]::Collect()
@@ -56,6 +57,7 @@ jobs:
             } else {
               New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -ErrorAction Stop
             }
+
             Add-LocalGroupMember -Group 'Remote Desktop Users' -Member $username -ErrorAction Stop
             Add-LocalGroupMember -Group 'Administrators' -Member $username -ErrorAction SilentlyContinue
           } catch {
@@ -92,10 +94,12 @@ jobs:
           }
 
           & $tailscaleExe version || Write-Host 'tailscale version failed to run'
+
+          # Quick egress test (control plane)
           Test-NetConnection -ComputerName pkgs.tailscale.com -Port 443 -InformationLevel Detailed | Out-Host
 
-          try { Start-Service -Name Tailscale -ErrorAction Stop } catch { Write-Host "Start-Service Tailscale returned: $_" }
-
+          # Start service and wait
+          try { Start-Service -Name Tailscale -ErrorAction Stop } catch { Write-Host "Start-Service returned: $_" }
           $serviceTimeout = 90
           $serviceTimer = [System.Diagnostics.Stopwatch]::StartNew()
           while ((Get-Service -Name Tailscale -ErrorAction SilentlyContinue).Status -ne 'Running') {
@@ -109,8 +113,7 @@ jobs:
           }
           Write-Host 'Tailscale service is running.'
 
-          # Use the documented flags for non-interactive Windows runs.
-          # The auth key must be a reusable pre-auth key created in the Tailscale admin console.
+          # Non-interactive "up" on Windows requires --auth-key and --unattended with a reusable pre-auth key
           $hostname = "gh-runner-$($env:GITHUB_RUN_ID)"
           $auth = $env:TAILSCALE_AUTH_KEY
 
@@ -119,7 +122,7 @@ jobs:
           Write-Host '=== tailscale up output ==='
           $upOutput | ForEach-Object { Write-Host $_ }
 
-          # Poll for Running backend state (allow terminal detection)
+          # Poll for Running (or terminal) backend state
           $timeout = 300
           $interval = 5
           $timer = [System.Diagnostics.Stopwatch]::StartNew()
@@ -139,6 +142,7 @@ jobs:
               Write-Host 'Tailscale is connected and running.'
               break
             }
+
             if ($status -and ($status.BackendState -in @('NeedsLogin','AuthFailed','Stopped'))) {
               Write-Host "Terminal backend state detected: $($status.BackendState)"
               break
@@ -162,7 +166,7 @@ jobs:
             exit 1
           }
 
-          # Connected: obtain IPv4 and verify RDP port
+          # Connected: obtain IPv4 and verify RDP port 3389
           $tsIP = (& $tailscaleExe ip -4) -join "`n"
           $tsIP = $tsIP -split '\s+' | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' } | Select-Object -First 1
           if (-not $tsIP) {
