@@ -1,4 +1,4 @@
-name: RDP-client-win11-arm
+name: RDP-client win11-arm
 
 on:
   workflow_dispatch:
@@ -60,8 +60,8 @@ jobs:
 
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-arm64.msi"
-          $installerPath = "$env:TEMP\tailscale.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe"
+          $installerPath = "$env:TEMP\tailscale.exe"
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
@@ -75,50 +75,26 @@ jobs:
               exit 1
           }
 
-          # Start Tailscale and explicitly wait for it to finish starting
-          Write-Host "Starting Tailscale..."
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
-          # Check the exit code of the last command
-          if ($LASTEXITCODE -ne 0) {
-              Write-Error "Tailscale up command failed with exit code $LASTEXITCODE."
-              # Optional: get more status info if it failed
-              & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-              exit 1
-          }
-
-          # Give the service a moment to stabilize before polling
-          Write-Host "Waiting for Tailscale to assign an IP..."
-          Start-Sleep -Seconds 10
 
           $tsIP = $null
           $retries = 0
-          # Increase retries for more resiliency
-          $maxRetries = 20
-
-          while (-not $tsIP -and $retries -lt $maxRetries) {
+          while (-not $tsIP -and $retries -lt 10) {
               $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              if (-not $tsIP) {
-                  Write-Host "Attempt $($retries + 1)/$($maxRetries): IP not yet assigned. Checking status..."
-                  & "$env:ProgramFiles\Tailscale\tailscale.exe" status
-                  Start-Sleep -Seconds 10
-                  $retries++
-              }
+              Start-Sleep -Seconds 5
+              $retries++
           }
 
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned after $($maxRetries * 10) seconds. Exiting."
+              Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
-
-          Write-Host "Successfully assigned Tailscale IP: $tsIP"
 
           $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 on $tsIP failed"
+              Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
-          Write-Host "Successfully connected to RDP port 3389 on $tsIP"
 
       - name: Notify Discord that RDP client is active (optional)
         env:
