@@ -21,14 +21,15 @@ jobs:
           # Allow incoming RDP
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
 
-          # Compatibility: adjust NLA/SecurityLayer as needed
+          # Compatibility: adjust NLA/SecurityLayer as needed (change for stronger security if desired)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
 
-          # Firewall rule (idempotent)
+          # Ensure firewall rule for RDP exists
           try { netsh advfirewall firewall delete rule name='RDP-Tailscale' 2>$null } catch {}
           netsh advfirewall firewall add rule name='RDP-Tailscale' dir=in action=allow protocol=TCP localport=3389
 
+          # Restart RDP service
           Restart-Service -Name TermService -Force
 
       - name: Create or update RDP user from secrets
@@ -44,7 +45,7 @@ jobs:
           $username = $env:RDP_USERNAME
           $plain = $env:RDP_PASSWORD
 
-          # Immediately convert to secure string and clear plaintext
+          # Convert immediately to secure string and clear plaintext
           $securePass = ConvertTo-SecureString $plain -AsPlainText -Force
           $plain = $null
           [System.GC]::Collect()
@@ -78,7 +79,7 @@ jobs:
             if (Test-Path $installerPath) { Remove-Item $installerPath -Force -ErrorAction SilentlyContinue }
           }
 
-      - name: Establish Tailscale connection and verify RDP port
+      - name: Bring Tailscale up (unattended)
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
@@ -94,12 +95,10 @@ jobs:
           }
 
           & $tailscaleExe version || Write-Host 'tailscale version failed to run'
-
-          # Quick egress test (control plane)
           Test-NetConnection -ComputerName pkgs.tailscale.com -Port 443 -InformationLevel Detailed | Out-Host
 
-          # Start service and wait
           try { Start-Service -Name Tailscale -ErrorAction Stop } catch { Write-Host "Start-Service returned: $_" }
+
           $serviceTimeout = 90
           $serviceTimer = [System.Diagnostics.Stopwatch]::StartNew()
           while ((Get-Service -Name Tailscale -ErrorAction SilentlyContinue).Status -ne 'Running') {
@@ -113,72 +112,110 @@ jobs:
           }
           Write-Host 'Tailscale service is running.'
 
-          # Non-interactive "up" on Windows requires --auth-key and --unattended with a reusable pre-auth key
+          # Use --auth-key and --unattended for non-interactive Windows runs (requires a reusable pre-auth key).
           $hostname = "gh-runner-$($env:GITHUB_RUN_ID)"
           $auth = $env:TAILSCALE_AUTH_KEY
 
-          # NOTE: --timeout expects a duration string (e.g. "60s" or "1m"). Use 60s here.
-          Write-Host "Running: tailscale up --auth-key=*** --hostname=$hostname --accept-routes --unattended --reset --timeout=60s"
-          $upOutput = & $tailscaleExe up --auth-key="$auth" --hostname="$hostname" --accept-routes --unattended --reset --timeout=60s 2>&1
-          Write-Host '=== tailscale up output ==='
-          $upOutput | ForEach-Object { Write-Host $_ }
+          # --timeout expects a duration (e.g. "60s")
+          & $tailscaleExe up --auth-key="$auth" --hostname="$hostname" --accept-routes --unattended --reset --timeout=60s 2>&1 | ForEach-Object { Write-Host $_ }
 
-          # Poll for Running (or terminal) backend state
-          $timeout = 300
-          $interval = 5
-          $timer = [System.Diagnostics.Stopwatch]::StartNew()
-          $status = $null
-          while ($timer.Elapsed.TotalSeconds -lt $timeout) {
+      - name: Keepalive & auto-recover (maintain connection for login)
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          # This step intentionally runs indefinitely to keep the runner available for RDP login.
+          # It:
+          #  - prevents sleep (best-effort),
+          #  - ensures TermService and Tailscale service are running,
+          #  - checks tailscale backend state and attempts a non-interactive up if it goes away,
+          #  - prints the assigned Tailscale IP so you can RDP to it.
+          $ErrorActionPreference = 'Continue'
+
+          # Try to disable sleep/hibernate to keep session reachable (may be restricted on hosted runners)
+          try {
+            powercfg /change monitor-timeout-ac 0
+            powercfg /change standby-timeout-ac 0
+            powercfg /hibernate off
+          } catch { Write-Host "powercfg adjust failed: $_" }
+
+          $tailscaleExe = 'C:\Program Files\Tailscale\tailscale.exe'
+          $auth = $env:TAILSCALE_AUTH_KEY
+          $hostname = "gh-runner-$($env:GITHUB_RUN_ID)"
+
+          function Ensure-ServiceRunning($name) {
+            try {
+              $svc = Get-Service -Name $name -ErrorAction SilentlyContinue
+              if (-not $svc) {
+                Write-Host "Service $name not found"
+                return
+              }
+              if ($svc.Status -ne 'Running') {
+                Write-Host "Starting service $name..."
+                Start-Service -Name $name -ErrorAction SilentlyContinue
+              }
+            } catch {
+              Write-Host "Ensure-ServiceRunning($name) failed: $_"
+            }
+          }
+
+          function Tailscale-BackendState() {
             try {
               $raw = & $tailscaleExe status --json 2>$null
               if ($raw) {
-                try { $status = $raw | ConvertFrom-Json -ErrorAction Stop } catch { $status = $null }
+                return ($raw | ConvertFrom-Json -ErrorAction Stop).BackendState
               }
-            } catch {}
+            } catch { }
+            return $null
+          }
 
-            $currentState = if ($status -and $status.PSObject.Properties.Match('BackendState')) { $status.BackendState } else { 'NoState' }
-            Write-Host "Waiting for Tailscale to connect... Current state: $currentState"
+          function Tailscale-IPv4() {
+            try {
+              $ips = & $tailscaleExe ip -4 2>$null
+              if ($ips) {
+                $ip = ($ips -split '\s+' | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' } | Select-Object -First 1)
+                return $ip
+              }
+            } catch { }
+            return $null
+          }
 
-            if ($status -and $status.BackendState -eq 'Running') {
-              Write-Host 'Tailscale is connected and running.'
-              break
+          # Initial status print
+          Ensure-ServiceRunning 'TermService'
+          Ensure-ServiceRunning 'Tailscale'
+          Start-Sleep -Seconds 2
+
+          $initialState = Tailscale-BackendState
+          Write-Host "Initial Tailscale backend state: $initialState"
+          $tsIP = Tailscale-IPv4
+          if ($tsIP) { Write-Host "Tailscale IP: $tsIP" } else { Write-Host "Tailscale IP not yet assigned" }
+
+          # Loop forever, verify services and tailscale state, attempt unattended up if needed.
+          $retryCount = 0
+          while ($true) {
+            Ensure-ServiceRunning 'TermService'
+            Ensure-ServiceRunning 'Tailscale'
+
+            $state = Tailscale-BackendState
+            if (-not $state -or $state -ne 'Running') {
+              Write-Host "Tailscale backend not Running (state='$state'). Attempting non-interactive up (retry #$retryCount)..."
+              try {
+                & $tailscaleExe up --auth-key="$auth" --hostname="$hostname" --accept-routes --unattended --reset --timeout=60s 2>&1 | ForEach-Object { Write-Host $_ }
+              } catch {
+                Write-Host "tailscale up attempt failed: $_"
+              }
+              $retryCount = $retryCount + 1
+            } else {
+              # If running, ensure we have an IP to tell you to connect to
+              $tsIP = Tailscale-IPv4
+              if ($tsIP) { Write-Host "Tailscale running: $tsIP" } else { Write-Host "Tailscale running but no IPv4 assigned yet" }
+              $retryCount = 0
             }
 
-            if ($status -and ($status.BackendState -in @('NeedsLogin','AuthFailed','Stopped'))) {
-              Write-Host "Terminal backend state detected: $($status.BackendState)"
-              break
+            # If many retries fail, pause longer to avoid hammering control plane
+            if ($retryCount -gt 6) {
+              Write-Host "Multiple failures detected; sleeping longer before next attempt."
+              Start-Sleep -Seconds 60
+            } else {
+              Start-Sleep -Seconds 20
             }
-
-            Start-Sleep -Seconds $interval
           }
-
-          if (-not $status -or $status.BackendState -ne 'Running') {
-            Write-Error "Timed out or failed waiting for Tailscale to connect. Final state: $($status.BackendState 2>$null)."
-            Write-Host ''
-            Write-Host '--- tailscale up captured output ---'
-            $upOutput | ForEach-Object { Write-Host $_ }
-            Write-Host ''
-            Write-Host '--- tailscale status (raw) ---'
-            & $tailscaleExe status || Write-Host 'tailscale status failed'
-            Write-Host ''
-            Write-Host 'If the final state is NeedsLogin or AuthFailed:'
-            Write-Host '  * Ensure TAILSCALE_AUTH_KEY is a reusable pre-auth key created at https://login.tailscale.com/admin/keys'
-            Write-Host '  * Ensure the key is pasted exactly into the repository secret'
-            exit 1
-          }
-
-          # Connected: obtain IPv4 and verify RDP port 3389
-          $tsIP = (& $tailscaleExe ip -4) -join "`n"
-          $tsIP = $tsIP -split '\s+' | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' } | Select-Object -First 1
-          if (-not $tsIP) {
-            Write-Error 'Tailscale is connected but failed to get an IPv4 address.'
-            exit 1
-          }
-          Write-Host "Tailscale IP assigned: $tsIP"
-
-          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
-          if (-not $testResult.TcpTestSucceeded) {
-            Write-Error "TCP connection to RDP port 3389 on $tsIP failed."
-            exit 1
-          }
-          Write-Host "Successfully connected to RDP port 3389 on Tailscale IP $tsIP."
