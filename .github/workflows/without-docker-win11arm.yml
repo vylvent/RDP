@@ -181,26 +181,3 @@ jobs:
             exit 1
           }
           Write-Host "Successfully connected to RDP port 3389 on Tailscale IP $tsIP."
-
-      - name: Optional: send Discord notification
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: |
-          if (-not $env:DISCORD_WEBHOOK) {
-            Write-Host 'DISCORD_WEBHOOK not set; skipping.'
-            exit 0
-          }
-          $payload = @{ content = "rdp-client active (runner: $env:GITHUB_RUN_ID)" } | ConvertTo-Json -Compress
-          try { Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop } catch { Write-Host "Discord send failed: $_" }
-
-      - name: Maintain heartbeat (optional)
-        env:
-          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-        run: |
-          while ($true) {
-            if ($env:DISCORD_WEBHOOK) {
-              $payload = @{ content = "rdp-client heartbeat (runner: $env:GITHUB_RUN_ID)" } | ConvertTo-Json -Compress
-              try { Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop } catch { Write-Host "Discord send failed: $_" }
-            }
-            Start-Sleep -Seconds 300
-          }
