@@ -74,7 +74,7 @@ jobs:
             if (Test-Path $installerPath) { Remove-Item $installerPath -Force -ErrorAction SilentlyContinue }
           }
 
-      - name: Establish Tailscale connection and verify RDP port (improved diagnostics)
+      - name: Establish Tailscale connection and verify RDP port (diagnostics + resilient up)
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
@@ -89,17 +89,15 @@ jobs:
             exit 1
           }
 
-          # Show version and binary info
+          # Show version and basic connectivity test to Tailscale package host
           & $tailscaleExe version || Write-Host "tailscale version failed to run"
+          Write-Host "Testing outbound connectivity to pkgs.tailscale.com..."
+          Test-NetConnection -ComputerName pkgs.tailscale.com -Port 443 -InformationLevel Detailed | Out-Host
 
-          # Ensure the service is started (the service name on Windows is 'Tailscale')
-          try {
-            Start-Service -Name Tailscale -ErrorAction Stop
-          } catch {
-            Write-Host "Start-Service Tailscale returned: $_"
-          }
+          # Ensure the service is started
+          try { Start-Service -Name Tailscale -ErrorAction Stop } catch { Write-Host "Start-Service Tailscale returned: $_" }
 
-          $serviceTimeout = 60
+          $serviceTimeout = 90
           $serviceTimer = [System.Diagnostics.Stopwatch]::StartNew()
           while ((Get-Service -Name Tailscale -ErrorAction SilentlyContinue).Status -ne 'Running') {
             if ($serviceTimer.Elapsed.TotalSeconds -ge $serviceTimeout) {
@@ -112,15 +110,17 @@ jobs:
           }
           Write-Host "Tailscale service is running."
 
-          # Run 'up' without --reset first. Use hostname interpolation safely.
+          # Attempt up with more verbosity and --reset (helps recover certain NoState conditions).
+          # NOTE: using --reset will clear local state. If your auth key is ephemeral or misconfigured,
+          # up may still fail; see diagnostics below.
           $hostname = "gh-runner-$($env:GITHUB_RUN_ID)"
           $auth = $env:TAILSCALE_AUTH_KEY
-          Write-Host "Running: tailscale up --authkey=*** --hostname=$hostname --accept-routes"
-          $upOutput = & $tailscaleExe up --authkey="$auth" --hostname="$hostname" --accept-routes 2>&1
-          Write-Host "tailscale up output:"
-          Write-Host $upOutput
+          Write-Host "Running: tailscale up --authkey=*** --hostname=$hostname --accept-routes --reset --verbose"
+          $upOutput = & $tailscaleExe up --authkey="$auth" --hostname="$hostname" --accept-routes --reset --verbose 2>&1
+          Write-Host "=== tailscale up output ==="
+          $upOutput | ForEach-Object { Write-Host $_ }
 
-          # Poll for a Running backend state, but allow for transient states and collect diagnostics if stuck
+          # Poll status; accept several backend states that indicate progress.
           $timeout = 300
           $interval = 5
           $timer = [System.Diagnostics.Stopwatch]::StartNew()
@@ -133,7 +133,7 @@ jobs:
               }
             } catch {}
 
-            $currentState = if ($status) { $status.BackendState } else { 'NoState' }
+            $currentState = if ($status -and $status.PSObject.Properties.Match('BackendState')) { $status.BackendState } else { 'NoState' }
             Write-Host "Waiting for Tailscale to connect... Current state: $currentState"
 
             if ($status -and $status.BackendState -eq 'Running') {
@@ -141,55 +141,77 @@ jobs:
               break
             }
 
+            # If we see 'NeedsLogin' or 'AuthFailed' quickly, break and show diagnostics
+            if ($status -and ($status.BackendState -in @('NeedsLogin','AuthFailed','Stopped'))) {
+              Write-Host "Detected terminal backend state: $($status.BackendState). Breaking to collect diagnostics."
+              break
+            }
+
             Start-Sleep -Seconds $interval
           }
 
           if (-not $status -or $status.BackendState -ne 'Running') {
-            Write-Error "Timed out waiting for Tailscale to connect. Final state: $($status.BackendState 2>$null). Collecting diagnostics..."
+            Write-Error "Timed out or failed waiting for Tailscale to connect. Final state: $($status.BackendState 2>$null). Collecting diagnostics..."
 
-            # Show basic diagnostics to help root-cause NoState:
-            Write-Host "`n=== tailscale status (raw) ==="
+            Write-Host "`n--- tailscale up captured output ---"
+            $upOutput | ForEach-Object { Write-Host $_ }
+
+            Write-Host "`n--- tailscale status (raw) ---"
             & $tailscaleExe status || Write-Host "tailscale status failed"
 
-            Write-Host "`n=== tailscale ip -4 ==="
-            (& $tailscaleExe ip -4 -family=ipv4) | ForEach-Object { Write-Host $_ } || Write-Host "tailscale ip failed"
+            Write-Host "`n--- tailscale ip -4 ---"
+            try { (& $tailscaleExe ip -4) | ForEach-Object { Write-Host $_ } } catch { Write-Host "tailscale ip failed: $_" }
 
-            Write-Host "`n=== tailscaled / service logs (if present) ==="
+            Write-Host "`n--- tailscaled / service logs (if present) ---"
             $possibleLogs = @(
               "C:\ProgramData\Tailscale\tailscaled.log",
               "C:\ProgramData\Tailscale\Logs\*",
               "C:\ProgramData\Tailscale\log\*"
             )
-            foreach ($p in $possibleLogs) {
-              if (Test-Path $p) {
-                Write-Host "Contents of $($p):"
+            foreach ($path in $possibleLogs) {
+              if (Test-Path $path) {
+                Write-Host "Contents of $($path):"
                 try {
-                  Get-ChildItem -Path $p -ErrorAction SilentlyContinue | ForEach-Object {
-                    Write-Host "---- $_ ----"
-                    try { Get-Content -Path $_ -Tail 200 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ } } catch {}
+                  Get-ChildItem -Path $path -ErrorAction SilentlyContinue | ForEach-Object {
+                    Write-Host "---- $($_.FullName) ----"
+                    try { Get-Content -Path $_.FullName -Tail 500 -ErrorAction SilentlyContinue | ForEach-Object { Write-Host $_ } } catch {}
                   }
-                } catch {}
+                } catch { Write-Host "Failed to enumerate $($path): $_" }
               } else {
-                Write-Host "No path: $p"
+                Write-Host "No path: $($path)"
               }
             }
 
-            Write-Host "`n=== Windows Service details ==="
+            Write-Host "`n--- Windows Service details ---"
             Get-Service -Name Tailscale -ErrorAction SilentlyContinue | Format-List * | Out-String | Write-Host
 
-            Write-Host "`n=== EventLog (Application) recent Tailscale-related entries ==="
+            Write-Host "`n--- Recent EventLog entries mentioning tailscale ---"
             try {
-              Get-WinEvent -MaxEvents 200 -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'tailscale' -or $_.ProviderName -match 'Tailscale' } | Select-Object -First 30 | Format-List TimeCreated, ProviderName, Id, LevelDisplayName, Message | Out-String | Write-Host
+              Get-WinEvent -MaxEvents 200 -ErrorAction SilentlyContinue | Where-Object { $_.Message -match 'tailscale' -or $_.ProviderName -match 'Tailscale' } | Select-Object -First 50 | Format-List TimeCreated, ProviderName, Id, LevelDisplayName, Message | Out-String | Write-Host
             } catch { Write-Host "Failed to query event log: $_" }
 
+            # Create a bugreport file for advanced diagnostics (may require admin/system access)
+            try {
+              $bugpath = Join-Path $env:TEMP "tailscale-bugreport-$(Get-Date -Format 'yyyyMMdd-HHmmss').tgz"
+              Write-Host "Attempting to generate tailscale bugreport to $bugpath (may fail if not permitted)..."
+              & $tailscaleExe bugreport --output="$bugpath" 2>&1 | ForEach-Object { Write-Host $_ }
+              if (Test-Path $bugpath) { Write-Host "Bugreport created: $bugpath" } else { Write-Host "Bugreport not created." }
+            } catch { Write-Host "tailscale bugreport failed: $_" }
+
+            Write-Host "`nIf the failure persists, common causes are: invalid/ephemeral auth key, network egress blocked to control plane, or incompatible binary for runner architecture."
+            Write-Host "Suggested next actions:"
+            Write-Host "  - Verify your TAILSCALE_AUTH_KEY is a reusable preauth key (not a one-time ephemeral key)."
+            Write-Host "  - Try creating a new preauth key in the admin console and re-run."
+            Write-Host "  - Ensure the runner has outbound HTTPS access to pkgs.tailscale.com and controlplane ports."
+            Write-Host "  - If the binary is incompatible with windows-11-arm, install a matching ARM build (you are running Tailscale 1.90.4; confirm it supports this runner)."
             exit 1
           }
 
-          # Get IPv4 and test port 3389
+          # If connected, get IPv4 and test RDP port
           $tsIP = (& $tailscaleExe ip -4) -join "`n"
           $tsIP = $tsIP -split '\s+' | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' } | Select-Object -First 1
           if (-not $tsIP) {
-            Write-Error "Tailscale is running, but failed to get an IPv4 address."
+            Write-Error "Tailscale is connected but failed to get an IPv4 address."
             exit 1
           }
           Write-Host "Tailscale IP assigned: $tsIP"
