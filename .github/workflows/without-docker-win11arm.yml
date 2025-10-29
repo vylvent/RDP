@@ -3,25 +3,36 @@ name: RDP-client win11-arm
 on:
   workflow_dispatch:
 
+defaults:
+  run:
+    shell: pwsh
+
 jobs:
   secure-rdp:
     runs-on: windows-11-arm
     timeout-minutes: 360
 
     steps:
-      - name: Configure Core RDP Settings
+      - name: Configure Core RDP settings
         run: |
+          # Allow incoming RDP connections
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-                            -Name "fDenyTSConnections" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                            -Name "UserAuthentication" -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-                            -Name "SecurityLayer" -Value 0 -Force
+            -Name "fDenyTSConnections" -Value 0 -Force
 
-          netsh advfirewall firewall delete rule name="RDP-Tailscale"
+          # Disable Network Level Authentication / SecurityLayer to allow plain RDP login (adjust if you want stronger security)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          # Ensure firewall rule allowing port 3389 exists (delete any old rule quietly)
+          try {
+            netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          } catch {}
           netsh advfirewall firewall add rule name="RDP-Tailscale" `
             dir=in action=allow protocol=TCP localport=3389
 
+          # Restart RDP service to apply registry changes
           Restart-Service -Name TermService -Force
 
       - name: Create or update RDP user from secrets (secure)
@@ -30,145 +41,177 @@ jobs:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
         run: |
           if (-not $env:RDP_USERNAME -or -not $env:RDP_PASSWORD) {
-              Write-Error "RDP_USERNAME and/or RDP_PASSWORD secrets are not set."
-              exit 1
+            Write-Error "RDP_USERNAME and/or RDP_PASSWORD secrets are not set."
+            exit 1
           }
 
           $username = $env:RDP_USERNAME
           $plain = $env:RDP_PASSWORD
 
+          # Convert to secure string ASAP and clear plaintext
           $securePass = ConvertTo-SecureString $plain -AsPlainText -Force
+          $plain = $null
+          [System.GC]::Collect()
+          [System.GC]::WaitForPendingFinalizers()
 
           try {
-              if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
-                  Set-LocalUser -Name $username -Password $securePass -ErrorAction Stop
-              } else {
-                  New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -ErrorAction Stop
-              }
+            $existing = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+            if ($existing) {
+              Set-LocalUser -Name $username -Password $securePass -ErrorAction Stop
+            } else {
+              New-LocalUser -Name $username -Password $securePass -AccountNeverExpires -ErrorAction Stop
+            }
 
-              Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction Stop
-              Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
+            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username -ErrorAction Stop
+
+            # Adding to Administrators is optional; ignore failures if not permitted
+            Add-LocalGroupMember -Group "Administrators" -Member $username -ErrorAction SilentlyContinue
           } catch {
-              Write-Error "Failed to create or update local user: $_"
-              exit 1
-          } finally {
-              # Clear plaintext password variable ASAP
-              $plain = $null
-              [System.GC]::Collect()
-              [System.GC]::WaitForPendingFinalizers()
+            Write-Error "Failed to create or update local user: $_"
+            exit 1
           }
 
       - name: Install Tailscale
         run: |
-          $installerPath = "$env:TEMP\tailscale-setup.exe"
-          Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $installerPath
-          Start-Process -FilePath $installerPath -ArgumentList "/quiet" -Wait
-          Remove-Item $installerPath -Force
+          $installerPath = Join-Path $env:TEMP "tailscale-setup.exe"
+          try {
+            Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe" -OutFile $installerPath -UseBasicParsing -ErrorAction Stop
+            Start-Process -FilePath $installerPath -ArgumentList "/quiet" -Wait -ErrorAction Stop
+          } catch {
+            Write-Error "Failed to download or install Tailscale: $_"
+            exit 1
+          } finally {
+            if (Test-Path $installerPath) { Remove-Item $installerPath -Force -ErrorAction SilentlyContinue }
+          }
 
       - name: Establish Tailscale connection and verify RDP port
         env:
           TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
           if (-not $env:TAILSCALE_AUTH_KEY) {
-              Write-Error "TAILSCALE_AUTH_KEY secret is not set."
-              exit 1
+            Write-Error "TAILSCALE_AUTH_KEY secret is not set."
+            exit 1
           }
 
-          # Start the Tailscale service
-          Start-Service -Name Tailscale
+          $tailscaleExe = "C:\Program Files\Tailscale\tailscale.exe"
+          if (-not (Test-Path $tailscaleExe)) {
+            Write-Error "Tailscale executable not found at $tailscaleExe"
+            exit 1
+          }
 
-          # Wait for the service to enter the 'Running' state before proceeding
-          $serviceTimeout = 30 # seconds
+          # Start the Tailscale service and wait until it is running
+          try {
+            Start-Service -Name Tailscale -ErrorAction Stop
+          } catch {
+            Write-Error "Failed to start Tailscale service: $_"
+            exit 1
+          }
+
+          $serviceTimeout = 30
           $serviceTimer = [System.Diagnostics.Stopwatch]::StartNew()
           while ((Get-Service -Name Tailscale).Status -ne 'Running') {
-              if ($serviceTimer.Elapsed.TotalSeconds -ge $serviceTimeout) {
-                  Write-Error "Timed out waiting for the Tailscale service to start."
-                  exit 1
-              }
-              Write-Host "Waiting for Tailscale service to start..."
-              Start-Sleep -Seconds 2
+            if ($serviceTimer.Elapsed.TotalSeconds -ge $serviceTimeout) {
+              Write-Error "Timed out waiting for the Tailscale service to start."
+              exit 1
+            }
+            Write-Host "Waiting for Tailscale service to start..."
+            Start-Sleep -Seconds 2
           }
           Write-Host "Tailscale service is running."
 
-          # Use --reset for a clean state and --accept-routes as good practice
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes --reset
+          # Bring the node up; ensure hostname uses PowerShell interpolation safely
+          $hostname = "gh-runner-$($env:GITHUB_RUN_ID)"
+          & $tailscaleExe up --authkey="$($env:TAILSCALE_AUTH_KEY)" --hostname="$hostname" --accept-routes --reset
 
-          # More robust waiting loop that checks the actual connection status
-          $timeout = 90 # seconds
-          $interval = 5  # seconds
+          # Wait for a connected backend state with retries and inspect status JSON
+          $timeout = 90
+          $interval = 5
           $timer = [System.Diagnostics.Stopwatch]::StartNew()
-
+          $status = $null
           while ($timer.Elapsed.TotalSeconds -lt $timeout) {
-              $status = & "C:\Program Files\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
-              if ($status.BackendState -eq 'Running') {
-                  Write-Host "Tailscale is connected and running."
-                  break
+            try {
+              $raw = & $tailscaleExe status --json 2>$null
+              if ($raw) {
+                try {
+                  $status = $raw | ConvertFrom-Json -ErrorAction Stop
+                } catch {
+                  # status might not be JSON yet; ignore and retry
+                }
               }
-              Write-Host "Waiting for Tailscale to connect... Current state: $($status.BackendState)"
-              Start-Sleep -Seconds $interval
+            } catch {
+              # tolerate intermittent failures while the daemon starts
+            }
+
+            if ($status -and $status.BackendState -eq 'Running') {
+              Write-Host "Tailscale is connected and running."
+              break
+            }
+
+            $currentState = if ($status) { $status.BackendState } else { 'Unknown' }
+            Write-Host "Waiting for Tailscale to connect... Current state: $currentState"
+            Start-Sleep -Seconds $interval
           }
 
-          if ($timer.Elapsed.TotalSeconds -ge $timeout) {
-              Write-Error "Timed out waiting for Tailscale to connect. Final state: $($status.BackendState). Please check your TAILSCALE_AUTH_KEY is valid and not expired."
-              # Added for more detailed debugging
-              & "C:\Program Files\Tailscale\tailscale.exe" status
-              exit 1
+          if (-not $status -or $status.BackendState -ne 'Running') {
+            Write-Error "Timed out waiting for Tailscale to connect. Final state: $($status.BackendState 2>$null)."
+            & $tailscaleExe status
+            exit 1
           }
 
-          # Now that we know it's connected, get the IP address
-          $tsIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          # Get the IPv4 address assigned to this node (trim whitespace; tailscale ip -4 may return multiple lines)
+          $tsIP = (& $tailscaleExe ip -4) -join "`n"
+          $tsIP = $tsIP -split '\s+' | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' } | Select-Object -First 1
           if (-not $tsIP) {
-              Write-Error "Tailscale is running, but failed to get an IP address."
-              exit 1
+            Write-Error "Tailscale is running, but failed to get an IPv4 address."
+            exit 1
           }
           Write-Host "Tailscale IP assigned: $tsIP"
 
-          # Verify the RDP port is accessible on the Tailscale IP
-          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389
+          # Verify RDP port is reachable on the Tailscale IP
+          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
           if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
+            Write-Error "TCP connection to RDP port 3389 on $tsIP failed (TcpTestSucceeded=$($testResult.TcpTestSucceeded))."
+            exit 1
           }
-          Write-Host "Successfully connected to RDP port 3389 on Tailscale IP."
+          Write-Host "Successfully connected to RDP port 3389 on Tailscale IP $tsIP."
 
       - name: Notify Discord that RDP client is active (optional)
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           function Send-DiscordMessage($message) {
-              if (-not $env:DISCORD_WEBHOOK) {
-                  Write-Host "DISCORD_WEBHOOK not set; skipping Discord notification."
-                  return
-              }
-              $payload = @{ content = $message } | ConvertTo-Json -Compress
-              try {
-                  Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
-              } catch {
-                  Write-Error "Failed to send Discord message: $_"
-              }
+            if (-not $env:DISCORD_WEBHOOK) {
+              Write-Host "DISCORD_WEBHOOK not set; skipping Discord notification."
+              return
+            }
+            $payload = @{ content = $message } | ConvertTo-Json -Compress
+            try {
+              Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
+            } catch {
+              Write-Host "Failed to send Discord message: $_"
+            }
           }
 
-          # Only send a minimal non-sensitive message; skip if webhook is not configured.
-          Send-DiscordMessage "rdp-client active"
+          Send-DiscordMessage "rdp-client active (runner: $env:GITHUB_RUN_ID)"
 
       - name: Maintain connection and periodic heartbeat (Discord optional)
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
           function Send-DiscordMessage($message) {
-              if (-not $env:DISCORD_WEBHOOK) {
-                  Write-Host "DISCORD_WEBHOOK not set; skipping Discord heartbeat."
-                  return
-              }
-              $payload = @{ content = $message } | ConvertTo-Json -Compress
-              try {
-                  Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
-              } catch {
-                  Write-Error "Failed to send Discord message: $_"
-              }
+            if (-not $env:DISCORD_WEBHOOK) {
+              return
+            }
+            $payload = @{ content = $message } | ConvertTo-Json -Compress
+            try {
+              Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop
+            } catch {
+              Write-Host "Failed to send Discord message: $_"
+            }
           }
 
+          Write-Host "Starting heartbeat. Press Ctrl+C to exit (workflow cancellation will stop the job)."
           while ($true) {
-              Send-DiscordMessage "rdp-client active"
-              Start-Sleep -Seconds 300
+            Send-DiscordMessage "rdp-client active (heartbeat) - runner: $env:GITHUB_RUN_ID"
+            Start-Sleep -Seconds 300
           }
