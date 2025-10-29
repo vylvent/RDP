@@ -74,9 +74,21 @@ jobs:
               exit 1
           }
 
-          # Start the Tailscale service and wait for it to initialize
+          # Start the Tailscale service
           Start-Service -Name Tailscale
-          Start-Sleep -Seconds 5
+
+          # Wait for the service to enter the 'Running' state before proceeding
+          $serviceTimeout = 30 # seconds
+          $serviceTimer = [System.Diagnostics.Stopwatch]::StartNew()
+          while ((Get-Service -Name Tailscale).Status -ne 'Running') {
+              if ($serviceTimer.Elapsed.TotalSeconds -ge $serviceTimeout) {
+                  Write-Error "Timed out waiting for the Tailscale service to start."
+                  exit 1
+              }
+              Write-Host "Waiting for Tailscale service to start..."
+              Start-Sleep -Seconds 2
+          }
+          Write-Host "Tailscale service is running."
 
           # Use --reset for a clean state and --accept-routes as good practice
           & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes --reset
