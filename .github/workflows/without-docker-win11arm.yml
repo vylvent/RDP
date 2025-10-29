@@ -19,7 +19,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' -Value 0 -Force
 
-          # (Optional) relax NLA/SecurityLayer for compatibility; change as needed for security
+          # Compatibility settings (adjust for your security needs)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'UserAuthentication' -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -94,7 +94,7 @@ jobs:
 
           & $tailscaleExe version || Write-Host 'tailscale version failed to run'
 
-          # Ensure service is running
+          # Ensure the service is running
           try { Start-Service -Name Tailscale -ErrorAction Stop } catch { Write-Host "Start-Service Tailscale returned: $_" }
 
           $serviceTimeout = 60
@@ -110,8 +110,7 @@ jobs:
           }
           Write-Host 'Tailscale service is running.'
 
-          # IMPORTANT: use --auth-key and --unattended for non-interactive Windows runs.
-          # The secret must contain a reusable pre-auth key created in the Tailscale Admin Console.
+          # Use documented flags for non-interactive Windows runs. The key must be a reusable pre-auth key.
           $hostname = "gh-runner-$($env:GITHUB_RUN_ID)"
           $auth = $env:TAILSCALE_AUTH_KEY
 
@@ -120,7 +119,7 @@ jobs:
           Write-Host '=== tailscale up output ==='
           $upOutput | ForEach-Object { Write-Host $_ }
 
-          # Poll for 'Running' backend state
+          # Poll for Running backend state
           $timeout = 300
           $interval = 5
           $timer = [System.Diagnostics.Stopwatch]::StartNew()
