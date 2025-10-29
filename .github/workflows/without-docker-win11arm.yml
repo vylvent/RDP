@@ -74,6 +74,10 @@ jobs:
               exit 1
           }
 
+          # Start the Tailscale service and wait for it to initialize
+          Start-Service -Name Tailscale
+          Start-Sleep -Seconds 5
+
           # Use --reset for a clean state and --accept-routes as good practice
           & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes --reset
 
@@ -94,6 +98,8 @@ jobs:
 
           if ($timer.Elapsed.TotalSeconds -ge $timeout) {
               Write-Error "Timed out waiting for Tailscale to connect. Final state: $($status.BackendState). Please check your TAILSCALE_AUTH_KEY is valid and not expired."
+              # Added for more detailed debugging
+              & "C:\Program Files\Tailscale\tailscale.exe" status
               exit 1
           }
 
