@@ -117,8 +117,9 @@ jobs:
           $hostname = "gh-runner-$($env:GITHUB_RUN_ID)"
           $auth = $env:TAILSCALE_AUTH_KEY
 
-          Write-Host "Running: tailscale up --auth-key=*** --hostname=$hostname --accept-routes --unattended --reset --timeout=60"
-          $upOutput = & $tailscaleExe up --auth-key="$auth" --hostname="$hostname" --accept-routes --unattended --reset --timeout=60 2>&1
+          # NOTE: --timeout expects a duration string (e.g. "60s" or "1m"). Use 60s here.
+          Write-Host "Running: tailscale up --auth-key=*** --hostname=$hostname --accept-routes --unattended --reset --timeout=60s"
+          $upOutput = & $tailscaleExe up --auth-key="$auth" --hostname="$hostname" --accept-routes --unattended --reset --timeout=60s 2>&1
           Write-Host '=== tailscale up output ==='
           $upOutput | ForEach-Object { Write-Host $_ }
 
