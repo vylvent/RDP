@@ -13,21 +13,21 @@ jobs:
     timeout-minutes: 360
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Configure Core RDP settings
         run: |
-          # Allow incoming RDP
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' -Value 0 -Force
+          # Allow incoming RDP connections
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' -Name 'fDenyTSConnections' -Value 0 -Force
 
-          # Compatibility settings (adjust for your security needs)
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication' -Value 0 -Force
-          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'SecurityLayer' -Value 0 -Force
+          # Adjust WinStation settings (change as needed for stronger security)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'UserAuthentication' -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' -Name 'SecurityLayer' -Value 0 -Force
 
+          # Ensure firewall rule to allow RDP exists
           try { netsh advfirewall firewall delete rule name='RDP-Tailscale' 2>$null } catch {}
-          netsh advfirewall firewall add rule name='RDP-Tailscale' `
-            dir=in action=allow protocol=TCP localport=3389
+          netsh advfirewall firewall add rule name='RDP-Tailscale' dir=in action=allow protocol=TCP localport=3389
 
           Restart-Service -Name TermService -Force
 
@@ -44,6 +44,7 @@ jobs:
           $username = $env:RDP_USERNAME
           $plain = $env:RDP_PASSWORD
 
+          # Convert immediately to secure string and clear plaintext
           $securePass = ConvertTo-SecureString $plain -AsPlainText -Force
           $plain = $null
           [System.GC]::Collect()
@@ -92,12 +93,14 @@ jobs:
             exit 1
           }
 
+          # Show version and confirm outbound connectivity to control plane host
           & $tailscaleExe version || Write-Host 'tailscale version failed to run'
+          Test-NetConnection -ComputerName pkgs.tailscale.com -Port 443 -InformationLevel Detailed | Out-Host
 
-          # Ensure the service is running
+          # Start the service and wait until 'Running'
           try { Start-Service -Name Tailscale -ErrorAction Stop } catch { Write-Host "Start-Service Tailscale returned: $_" }
 
-          $serviceTimeout = 60
+          $serviceTimeout = 90
           $serviceTimer = [System.Diagnostics.Stopwatch]::StartNew()
           while ((Get-Service -Name Tailscale -ErrorAction SilentlyContinue).Status -ne 'Running') {
             if ($serviceTimer.Elapsed.TotalSeconds -ge $serviceTimeout) {
@@ -110,7 +113,8 @@ jobs:
           }
           Write-Host 'Tailscale service is running.'
 
-          # Use documented flags for non-interactive Windows runs. The key must be a reusable pre-auth key.
+          # Use documented flags for non-interactive Windows runs.
+          # IMPORTANT: the auth key must be a reusable pre-auth key from the Tailscale Admin Console.
           $hostname = "gh-runner-$($env:GITHUB_RUN_ID)"
           $auth = $env:TAILSCALE_AUTH_KEY
 
@@ -119,7 +123,7 @@ jobs:
           Write-Host '=== tailscale up output ==='
           $upOutput | ForEach-Object { Write-Host $_ }
 
-          # Poll for Running backend state
+          # Poll for Running backend state (or terminal states)
           $timeout = 300
           $interval = 5
           $timer = [System.Diagnostics.Stopwatch]::StartNew()
@@ -131,38 +135,62 @@ jobs:
                 try { $status = $raw | ConvertFrom-Json -ErrorAction Stop } catch { $status = $null }
               }
             } catch {}
+
             $currentState = if ($status -and $status.PSObject.Properties.Match('BackendState')) { $status.BackendState } else { 'NoState' }
             Write-Host "Waiting for Tailscale to connect... Current state: $currentState"
-            if ($status -and $status.BackendState -eq 'Running') { Write-Host 'Tailscale is connected and running.'; break }
-            if ($status -and ($status.BackendState -in @('NeedsLogin','AuthFailed','Stopped'))) { Write-Host "Terminal backend state: $($status.BackendState)"; break }
+
+            if ($status -and $status.BackendState -eq 'Running') {
+              Write-Host 'Tailscale is connected and running.'
+              break
+            }
+
+            if ($status -and ($status.BackendState -in @('NeedsLogin','AuthFailed','Stopped'))) {
+              Write-Host "Terminal backend state detected: $($status.BackendState)"
+              break
+            }
+
             Start-Sleep -Seconds $interval
           }
 
           if (-not $status -or $status.BackendState -ne 'Running') {
             Write-Error "Timed out or failed waiting for Tailscale to connect. Final state: $($status.BackendState 2>$null)."
-            Write-Host '`n--- tailscale up captured output ---'
+            Write-Host ''
+            Write-Host '--- tailscale up captured output ---'
             $upOutput | ForEach-Object { Write-Host $_ }
-            Write-Host '`n--- tailscale status (raw) ---'
+            Write-Host ''
+            Write-Host '--- tailscale status (raw) ---'
             & $tailscaleExe status || Write-Host 'tailscale status failed'
-            Write-Host '`nIf this shows NeedsLogin or AuthFailed, verify your TAILSCALE_AUTH_KEY is a reusable pre-auth key (not a one-time/ephemeral key).'
-            Write-Host 'Create a reusable pre-auth key at https://login.tailscale.com/admin/keys and store it in the repository secret TAILSCALE_AUTH_KEY.'
+            Write-Host ''
+            Write-Host 'If the final state is NeedsLogin or AuthFailed:'
+            Write-Host '  * Ensure TAILSCALE_AUTH_KEY is a reusable pre-auth key created at https://login.tailscale.com/admin/keys'
+            Write-Host '  * Ensure the key is pasted exactly into the repository secret'
             exit 1
           }
 
-          # Get IP and verify RDP port
+          # Connected: obtain IPv4 and verify RDP port
           $tsIP = (& $tailscaleExe ip -4) -join "`n"
           $tsIP = $tsIP -split '\s+' | Where-Object { $_ -match '\d+\.\d+\.\d+\.\d+' } | Select-Object -First 1
-          if (-not $tsIP) { Write-Error 'Tailscale is connected but failed to get an IPv4 address.'; exit 1 }
+          if (-not $tsIP) {
+            Write-Error 'Tailscale is connected but failed to get an IPv4 address.'
+            exit 1
+          }
           Write-Host "Tailscale IP assigned: $tsIP"
+
           $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -WarningAction SilentlyContinue
-          if (-not $testResult.TcpTestSucceeded) { Write-Error "TCP connection to RDP port 3389 on $tsIP failed."; exit 1 }
+          if (-not $testResult.TcpTestSucceeded) {
+            Write-Error "TCP connection to RDP port 3389 on $tsIP failed."
+            exit 1
+          }
           Write-Host "Successfully connected to RDP port 3389 on Tailscale IP $tsIP."
 
       - name: Optional: send Discord notification
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
         run: |
-          if (-not $env:DISCORD_WEBHOOK) { Write-Host 'DISCORD_WEBHOOK not set; skipping.'; exit 0 }
+          if (-not $env:DISCORD_WEBHOOK) {
+            Write-Host 'DISCORD_WEBHOOK not set; skipping.'
+            exit 0
+          }
           $payload = @{ content = "rdp-client active (runner: $env:GITHUB_RUN_ID)" } | ConvertTo-Json -Compress
           try { Invoke-RestMethod -Uri $env:DISCORD_WEBHOOK -Method Post -ContentType 'application/json' -Body $payload -ErrorAction Stop } catch { Write-Host "Discord send failed: $_" }
 
