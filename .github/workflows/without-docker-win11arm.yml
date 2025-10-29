@@ -74,26 +74,44 @@ jobs:
               exit 1
           }
 
-          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID
+          # Use --reset for a clean state and --accept-routes as good practice
+          & "C:\Program Files\Tailscale\tailscale.exe" up --authkey=$env:TAILSCALE_AUTH_KEY --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes --reset
 
-          $tsIP = $null
-          $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
-              $retries++
+          # More robust waiting loop that checks the actual connection status
+          $timeout = 90 # seconds
+          $interval = 5  # seconds
+          $timer = [System.Diagnostics.Stopwatch]::StartNew()
+
+          while ($timer.Elapsed.TotalSeconds -lt $timeout) {
+              $status = & "C:\Program Files\Tailscale\tailscale.exe" status --json | ConvertFrom-Json
+              if ($status.BackendState -eq 'Running') {
+                  Write-Host "Tailscale is connected and running."
+                  break
+              }
+              Write-Host "Waiting for Tailscale to connect... Current state: $($status.BackendState)"
+              Start-Sleep -Seconds $interval
           }
 
-          if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
+          if ($timer.Elapsed.TotalSeconds -ge $timeout) {
+              Write-Error "Timed out waiting for Tailscale to connect. Final state: $($status.BackendState). Please check your TAILSCALE_AUTH_KEY is valid and not expired."
               exit 1
           }
 
+          # Now that we know it's connected, get the IP address
+          $tsIP = & "C:\Program Files\Tailscale\tailscale.exe" ip -4
+          if (-not $tsIP) {
+              Write-Error "Tailscale is running, but failed to get an IP address."
+              exit 1
+          }
+          Write-Host "Tailscale IP assigned: $tsIP"
+
+          # Verify the RDP port is accessible on the Tailscale IP
           $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389
           if (-not $testResult.TcpTestSucceeded) {
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
+          Write-Host "Successfully connected to RDP port 3389 on Tailscale IP."
 
       - name: Notify Discord that RDP client is active (optional)
         env:
