@@ -1,4 +1,4 @@
-rem2
+name: RDP-client without docker
 
 on:
   workflow_dispatch:
