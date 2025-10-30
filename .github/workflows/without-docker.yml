@@ -96,66 +96,7 @@ jobs:
               exit 1
           }
 
-      - name: Install LDPlayer (attempt)
-        env:
-          LDPLAYER_URL: ${{ secrets.LDPLAYER_URL }}
-        run: |
-          Write-Host "Attempting to install LDPlayer (Android emulator). Note: GitHub-hosted runners may not support virtualization or UI installers."
-          $ldUrl = $env:LDPLAYER_URL
-          if (-not $ldUrl -or $ldUrl -eq "") {
-              # Default fallback URL - please replace with the exact official installer you want or set secret LDPLAYER_URL
-              $ldUrl = "https://res.ldrescdn.com/download/LDPlayer9.exe?n=LDPlayer9_ens_1001_ld.exe"
-              Write-Host "No LDPLAYER_URL secret set; using fallback URL: $ldUrl"
-          } else {
-              Write-Host "Using LDPLAYER_URL from secrets."
-          }
-
-          $installer = "$env:TEMP\ldplayer_installer.exe"
-          try {
-              Write-Host "Downloading LDPlayer installer..."
-              Invoke-WebRequest -Uri $ldUrl -OutFile $installer -UseBasicParsing -ErrorAction Stop
-              Write-Host "Downloaded to $installer"
-          } catch {
-              Write-Warning "Failed to download LDPlayer installer: $_"
-          }
-
-          if (Test-Path $installer) {
-              try {
-                  Write-Host "Attempting silent install via common /S flag..."
-                  Start-Process -FilePath $installer -ArgumentList "/S" -Wait -NoNewWindow -ErrorAction Stop
-                  Write-Host "Installer exited. Checking for LDPlayer process..."
-              } catch {
-                  Write-Warning "Silent install with /S failed: $_"
-                  try {
-                      Write-Host "Attempting unattended install with /quiet..."
-                      Start-Process -FilePath $installer -ArgumentList "/quiet" -Wait -NoNewWindow -ErrorAction Stop
-                  } catch {
-                      Write-Warning "Unattended install attempt failed: $_"
-                  }
-              }
-              Remove-Item $installer -Force -ErrorAction SilentlyContinue
-          } else {
-              Write-Warning "Installer file not downloaded; skipping installer execution."
-          }
-
-          # Try winget as alternative if available
-          try {
-              Write-Host "Trying winget to install LDPlayer (if a package exists)..."
-              winget install --silent --accept-package-agreements --accept-source-agreements LDPlayer || winget install --silent --accept-package-agreements --accept-source-agreements ldplayer
-          } catch {
-              Write-Host "winget install attempts for LDPlayer may not be available or failed: $_"
-          }
-
-          # Basic verification (process name may vary)
-          Start-Sleep -Seconds 5
-          $proc = Get-Process -Name "dnplayer" -ErrorAction SilentlyContinue
-          if ($proc) {
-              Write-Host "LDPlayer process detected: $($proc.Id)"
-          } else {
-              Write-Warning "LDPlayer process not detected. The install may have failed or the emulator may require a reboot / self-hosted runner."
-          }
-
-      - name: Install Google Play Games for PC (attempt)
+    - name: Install Google Play Games for PC (attempt)
         env:
           GOOGLE_PLAY_URL: ${{ secrets.GOOGLE_PLAY_URL }}
         run: |
