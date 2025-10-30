@@ -96,6 +96,123 @@ jobs:
               exit 1
           }
 
+      - name: Install LDPlayer (attempt)
+        env:
+          LDPLAYER_URL: ${{ secrets.LDPLAYER_URL }}
+        run: |
+          Write-Host "Attempting to install LDPlayer (Android emulator). Note: GitHub-hosted runners may not support virtualization or UI installers."
+          $ldUrl = $env:LDPLAYER_URL
+          if (-not $ldUrl -or $ldUrl -eq "") {
+              # Default fallback URL - please replace with the exact official installer you want or set secret LDPLAYER_URL
+              $ldUrl = "https://res.ldrescdn.com/download/LDPlayer9.exe?n=LDPlayer9_ens_1001_ld.exe"
+              Write-Host "No LDPLAYER_URL secret set; using fallback URL: $ldUrl"
+          } else {
+              Write-Host "Using LDPLAYER_URL from secrets."
+          }
+
+          $installer = "$env:TEMP\ldplayer_installer.exe"
+          try {
+              Write-Host "Downloading LDPlayer installer..."
+              Invoke-WebRequest -Uri $ldUrl -OutFile $installer -UseBasicParsing -ErrorAction Stop
+              Write-Host "Downloaded to $installer"
+          } catch {
+              Write-Warning "Failed to download LDPlayer installer: $_"
+          }
+
+          if (Test-Path $installer) {
+              try {
+                  Write-Host "Attempting silent install via common /S flag..."
+                  Start-Process -FilePath $installer -ArgumentList "/S" -Wait -NoNewWindow -ErrorAction Stop
+                  Write-Host "Installer exited. Checking for LDPlayer process..."
+              } catch {
+                  Write-Warning "Silent install with /S failed: $_"
+                  try {
+                      Write-Host "Attempting unattended install with /quiet..."
+                      Start-Process -FilePath $installer -ArgumentList "/quiet" -Wait -NoNewWindow -ErrorAction Stop
+                  } catch {
+                      Write-Warning "Unattended install attempt failed: $_"
+                  }
+              }
+              Remove-Item $installer -Force -ErrorAction SilentlyContinue
+          } else {
+              Write-Warning "Installer file not downloaded; skipping installer execution."
+          }
+
+          # Try winget as alternative if available
+          try {
+              Write-Host "Trying winget to install LDPlayer (if a package exists)..."
+              winget install --silent --accept-package-agreements --accept-source-agreements LDPlayer || winget install --silent --accept-package-agreements --accept-source-agreements ldplayer
+          } catch {
+              Write-Host "winget install attempts for LDPlayer may not be available or failed: $_"
+          }
+
+          # Basic verification (process name may vary)
+          Start-Sleep -Seconds 5
+          $proc = Get-Process -Name "dnplayer" -ErrorAction SilentlyContinue
+          if ($proc) {
+              Write-Host "LDPlayer process detected: $($proc.Id)"
+          } else {
+              Write-Warning "LDPlayer process not detected. The install may have failed or the emulator may require a reboot / self-hosted runner."
+          }
+
+      - name: Install Google Play Games for PC (attempt)
+        env:
+          GOOGLE_PLAY_URL: ${{ secrets.GOOGLE_PLAY_URL }}
+        run: |
+          Write-Host "Attempting to install Google Play Games for PC. Note: this may require Microsoft Store or interactive install; success is not guaranteed on hosted runners."
+          $gpUrl = $env:GOOGLE_PLAY_URL
+          if (-not $gpUrl -or $gpUrl -eq "") {
+              # Default fallback URL placeholder. Replace with official installer URL or set secret GOOGLE_PLAY_URL
+              $gpUrl = "https://dl.google.com/tag/s/CiZ7NDdCMDdENzEtNTA1RC00NjY1LUFGRDQtNDk3MkEzMEM2NTMwfRIEYmV0YRrKAQrHAQgKEmpNS1QtR1BSLW5hLXVzLTE3MTIwMTQtTWVkLWhhc2VtLXB5LWdwZ2JldGEtT2N0MjgyNS1UZXh0X1NlYXJjaF9CS1dTLUdQRy1MUFRlc3R8QlJPfE9OU0VNX2t3aWRfMzg0NTA3MDE2MDM5GhZodHRwczovL3d3dy5nb29nbGUuY29tIjp1dG1fc291cmNlPW5hX01lZCZ1dG1fY29udGVudD1PY3QyODI1JnV0bV9jYW1wYWlnbj1ncGdiZXRhKJaD1AkqKwjuCxImezYwZWM3NTVmLWEwNjgtNGIzZi1hMWI4LWE5M2NhNTExYTIzOX1AAUoFZW4tVVM/play/games/install/Install-GooglePlayGames.exe"
+              Write-Host "No GOOGLE_PLAY_URL secret set; using fallback URL: $gpUrl"
+          } else {
+              Write-Host "Using GOOGLE_PLAY_URL from secrets."
+          }
+
+          $installer = "$env:TEMP\googleplaygames_installer.exe"
+          try {
+              Write-Host "Downloading Google Play Games installer..."
+              Invoke-WebRequest -Uri $gpUrl -OutFile $installer -UseBasicParsing -ErrorAction Stop
+              Write-Host "Downloaded to $installer"
+          } catch {
+              Write-Warning "Failed to download Google Play Games installer: $_"
+          }
+
+          if (Test-Path $installer) {
+              try {
+                  Write-Host "Attempting silent install..."
+                  Start-Process -FilePath $installer -ArgumentList "/S" -Wait -NoNewWindow -ErrorAction Stop
+              } catch {
+                  Write-Warning "Silent install failed or not supported: $_"
+                  try {
+                      Write-Host "Attempting /quiet install..."
+                      Start-Process -FilePath $installer -ArgumentList "/quiet" -Wait -NoNewWindow -ErrorAction Stop
+                  } catch {
+                      Write-Warning "Unattended install attempts failed: $_"
+                  }
+              }
+              Remove-Item $installer -Force -ErrorAction SilentlyContinue
+          } else {
+              Write-Warning "Installer file not downloaded; skipping installer execution."
+          }
+
+          # winget attempt for Google Play Games (package id may vary; try common ids)
+          try {
+              Write-Host "Trying winget to install Google Play Games (if available)..."
+              winget install --silent --accept-package-agreements --accept-source-agreements "Google.Play.Games" || winget install --silent --accept-package-agreements --accept-source-agreements "GooglePlayGames"
+          } catch {
+              Write-Host "winget install attempts for Google Play Games may not be available or failed: $_"
+          }
+
+          # Basic verification
+          Start-Sleep -Seconds 5
+          $proc = Get-Process -Name "GooglePlayGames" -ErrorAction SilentlyContinue
+          if ($proc) {
+              Write-Host "Google Play Games process detected: $($proc.Id)"
+          } else {
+              Write-Warning "Google Play Games process not detected. If this is required, consider using a self-hosted runner with GUI/virtualization capabilities or provide an official installer URL in secrets."
+          }
+
       - name: Notify Discord that RDP client is active (optional)
         env:
           DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
