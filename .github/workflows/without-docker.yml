@@ -96,24 +96,100 @@ jobs:
               exit 1
           }
 
-      - name: Download Google Play Games for PC installer (only)
+      - name: Download and silent-install MEmu (no guard)
         run: |
-          # Download only — do not attempt to run/install on GitHub-hosted runner.
-          $url = "https://dl.google.com/tag/s/CiZ7NDdCMDdENzEtNTA1RC00NjY1LUFGRDQtNDk3MkEzMEM2NTMwfRIEYmV0YRrKAQrHAQgKEmpNS1QtR1BSLW5hLXVzLTE3MTIwMTQtTWVkLWhhc2VtLXB5LWdwZ2JldGEtT2N0MjgyNS1UZXh0X1NlYXJjaF9CS1dTLUdQRy1MUFRlc3R8QlJPfE9OU0VNX2t3aWRfMzg0NTA3MDE2MDM5GhZodHRwczovL3d3dy5nb29nbGUuY29tIjp1dG1fc291cmNlPW5hX01lZCZ1dG1fY29udGVudD1PY3QyODI1JnV0bV9jYW1wYWlnbj1ncGdiZXRhKJaD1AkqKwjuCxImezYwZWM3NTVmLWEwNjgtNGIzZi1hMWI4LWE5M2NhNTExYTIzOX1AAUoFZW4tVVM/play/games/install/Install-GooglePlayGames.exe"
-          $out = "$env:TEMP\Install-GooglePlayGames.exe"
-          Write-Host "Downloading Google Play Games installer to $out"
+          
+          $memuUrl = "https://www.memuplay.com/download-memu-on-pc.html?from=online2_installer"
+          $installer = "$env:TEMP\MEmuOnlineInstaller.exe"
+          $log = "$env:TEMP\memu_install.log"
+
+          Write-Host "Downloading MEmu installer from $memuUrl to $installer"
           try {
-              Invoke-WebRequest -Uri $url -OutFile $out -UseBasicParsing -ErrorAction Stop
-              if (Test-Path $out) {
-                  Write-Host "Download successful:"
-                  Get-Item $out | Select-Object FullName, Length
-              } else {
-                  Write-Error "Download did not produce the expected file."
+              Invoke-WebRequest -Uri $memuUrl -OutFile $installer -UseBasicParsing -ErrorAction Stop
+              if (-not (Test-Path $installer)) {
+                  Write-Error "Download completed but file not found at $installer"
                   exit 1
               }
+              Write-Host "Download successful: $(Get-Item $installer | Select-Object FullName, Length)"
           } catch {
-              Write-Error "Failed to download Google Play Games installer: $_"
+              Write-Error "Failed to download MEmu installer: $_"
               exit 1
+          }
+
+          # Try several common silent flags until one appears to succeed. Log stdout/stderr where possible.
+          $attempted = $false
+          $exitCode = 1
+
+          function Try-Install($args) {
+              param($args)
+              Write-Host "Trying installer with arguments: $args"
+              try {
+                  Start-Process -FilePath $installer -ArgumentList $args -Wait -NoNewWindow -PassThru *>&1 | Tee-Object -FilePath $log -Append
+                  $global:exitCode = $LASTEXITCODE
+                  Write-Host "Installer process exited with code $global:exitCode"
+                  return $true
+              } catch {
+                  Write-Warning "Installer attempt with '$args' threw an exception: $_"
+                  return $false
+              }
+          }
+
+          # Common silent flags (order of attempts)
+          $flagsToTry = @(
+              "/S",               # NSIS / generic silent
+              "/silent",          # some installers
+              "/VERYSILENT",      # Inno/NSIS variant
+              "/quiet",           # msiexec-like or other
+              "/qn"               # MSI-style (will be ignored by EXE wrappers)
+          )
+
+          foreach ($f in $flagsToTry) {
+              $attempted = $true
+              if (Try-Install $f) {
+                  Start-Sleep -Seconds 5
+                  # Heuristic: check for expected install folder or running process
+                  $installed = $false
+                  # Common MEmu install paths to check
+                  $possiblePaths = @(
+                      "$env:ProgramFiles\Microvirt\MEmu",
+                      "$env:ProgramFiles(x86)\Microvirt\MEmu",
+                      "$env:ProgramFiles\MEmu",
+                      "$env:ProgramFiles(x86)\MEmu"
+                  )
+                  foreach ($p in $possiblePaths) {
+                      if (Test-Path $p) {
+                          Write-Host "Found possible installation directory: $p"
+                          $installed = $true
+                          break
+                      }
+                  }
+                  # Or check for a running process (dnplayer/emulator process names may vary)
+                  $proc = Get-Process -Name "dnplayer" -ErrorAction SilentlyContinue
+                  if ($proc) {
+                      Write-Host "Detected dnplayer process: $($proc.Id)"
+                      $installed = $true
+                  }
+
+                  if ($installed) {
+                      Write-Host "MEmu appears to be installed or running after using flags: $f"
+                      $global:exitCode = 0
+                      break
+                  } else {
+                      Write-Warning "No obvious installation artifacts found after using flags: $f (check $log). Trying next flag."
+                  }
+              }
+          }
+
+          if (-not $attempted) {
+              Write-Error "No install attempts were made."
+              exit 1
+          }
+
+          if ($global:exitCode -ne 0) {
+              Write-Error "All silent install attempts failed. Check $log for details. Exiting with failure."
+              exit $global:exitCode
+          } else {
+              Write-Host "MEmu silent install step completed (exit code $global:exitCode)."
           }
 
       - name: Notify Discord that RDP client is active (optional)
