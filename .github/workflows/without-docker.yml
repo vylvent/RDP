@@ -96,8 +96,9 @@ jobs:
               exit 1
           }
 
-      - name: Download and silent-install MEmu (use /S)
+      - name: Download and silent-install MEmu (uses /S)
         run: |
+          # WARNING: GitHub-hosted Windows runners may not support virtualization or GUI installs required by Android emulators.
           $memuUrl = "https://www.memuplay.com/download-memu-on-pc.html?from=online2_installer"
           $installer = "$env:TEMP\MEmuOnlineInstaller.exe"
           $log = "$env:TEMP\memu_install.log"
@@ -126,7 +127,7 @@ jobs:
           }
 
           if ($exit -ne 0) {
-              Write-Error "Installer returned non-zero exit code ($exit). Check $log for details and consider running on a self-hosted runner."
+              Write-Error "Installer returned non-zero exit code ($exit). Check $log for details and consider using a self-hosted runner."
               exit $exit
           }
 
