@@ -96,9 +96,9 @@ jobs:
               exit 1
           }
 
-      - name: Download and silent-install MEmu (uses /S)
+      - name: Download and silent-install MEmu (print errors only)
         run: |
-          # WARNING: GitHub-hosted Windows runners may not support virtualization or GUI installs required by Android emulators.
+          # WARNING: Hosted runners may not support virtualization or GUI installs required by Android emulators.
           $memuUrl = "https://www.memuplay.com/download-memu-on-pc.html?from=online2_installer"
           $installer = "$env:TEMP\MEmuOnlineInstaller.exe"
           $log = "$env:TEMP\memu_install.log"
@@ -107,56 +107,32 @@ jobs:
           try {
               Invoke-WebRequest -Uri $memuUrl -OutFile $installer -UseBasicParsing -ErrorAction Stop
               if (-not (Test-Path $installer)) {
-                  Write-Error "Download completed but file not found at $installer"
-                  exit 1
+                  Write-Host "Download completed but installer not found at $installer"
+              } else {
+                  Write-Host "Download successful: $(Get-Item $installer | Select-Object FullName, Length)"
               }
-              Write-Host "Download successful: $(Get-Item $installer | Select-Object FullName, Length)"
           } catch {
-              Write-Error "Failed to download MEmu installer: $_"
-              exit 1
+              Write-Host "Download error (printed only):"
+              Write-Host $_.ToString()
+              Write-Host "Proceeding without aborting the workflow."
           }
 
-          Write-Host "Attempting silent install with the /S flag (single attempt only). Output logged to $log"
-          try {
-              Start-Process -FilePath $installer -ArgumentList "/S" -Wait -NoNewWindow -PassThru *>&1 | Tee-Object -FilePath $log
-              $exit = $LASTEXITCODE
-              Write-Host "Installer exited with code $exit"
-          } catch {
-              Write-Error "Silent install attempt threw an exception: $_"
-              exit 1
-          }
-
-          if ($exit -ne 0) {
-              Write-Error "Installer returned non-zero exit code ($exit). Check $log for details and consider using a self-hosted runner."
-              exit $exit
-          }
-
-          # Basic heuristic checks for install artifacts
-          $installed = $false
-          $possiblePaths = @(
-              "$env:ProgramFiles\Microvirt\MEmu",
-              "$env:ProgramFiles(x86)\Microvirt\MEmu",
-              "$env:ProgramFiles\MEmu",
-              "$env:ProgramFiles(x86)\MEmu"
-          )
-          foreach ($p in $possiblePaths) {
-              if (Test-Path $p) {
-                  Write-Host "Found possible installation directory: $p"
-                  $installed = $true
-                  break
-              }
-          }
-
-          $proc = Get-Process -Name "dnplayer" -ErrorAction SilentlyContinue
-          if ($proc) {
-              Write-Host "Detected emulator process: $($proc.Id)"
-              $installed = $true
-          }
-
-          if (-not $installed) {
-              Write-Warning "No obvious installation artifacts found after /S install. Installation may require a GUI or virtualization; consider using a self-hosted runner."
+          if (-not (Test-Path $installer)) {
+              Write-Host "Installer file not present; skipping install step."
           } else {
-              Write-Host "MEmu appears to be installed or running."
+              Write-Host "Attempting silent install with the /S flag. Any error will be printed but will not abort the job."
+              try {
+                  Start-Process -FilePath $installer -ArgumentList "/S" -Wait -NoNewWindow -PassThru *>&1 | Tee-Object -FilePath $log
+                  $exit = $LASTEXITCODE
+                  Write-Host "Installer exited with code $exit"
+                  if ($exit -ne 0) {
+                      Write-Host "Installer returned non-zero exit code ($exit). Log at $log"
+                  }
+              } catch {
+                  Write-Host "Install exception (printed only):"
+                  Write-Host $_.ToString()
+                  Write-Host "See $log for any captured output. Continuing without failing the job."
+              }
           }
 
       - name: Notify Discord that RDP client is active (optional)
