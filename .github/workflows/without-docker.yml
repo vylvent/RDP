@@ -99,7 +99,7 @@ jobs:
       - name: Download and silent-install MEmu (print errors only)
         run: |
           # WARNING: Hosted runners may not support virtualization or GUI installs required by Android emulators.
-          $memuUrl = "https://www.memuplay.com/download-memu-on-pc.html?from=online2_installer"
+          $memuUrl = "https://www.memuplay.com/download-new.php?from=online2_installer"
           $installer = "$env:TEMP\MEmuOnlineInstaller.exe"
           $log = "$env:TEMP\memu_install.log"
 
